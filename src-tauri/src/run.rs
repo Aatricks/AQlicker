@@ -647,8 +647,9 @@ fn execute_schedule(
             return WorkerExit::Idle(StopReason::DurationComplete);
         }
         // A cooldown can hold the worker for up to a minute. Republish the run
-        // clock across the wait, the way the pause gate does, so elapsed and
-        // remaining time keep moving instead of freezing between presses. A
+        // clock across the wait so elapsed time keeps moving instead of
+        // freezing between presses. (The pause gate publishes only when a pause
+        // begins or ends, so a long pause still freezes it.) A
         // cancel arriving mid-wait must return here: the chunk consumes it, so
         // dropping out into the wait below would lose it and never stop.
         while plan.target_offset.saturating_sub(clock.elapsed()) > PROGRESS_PUBLISH_INTERVAL {

@@ -30,7 +30,6 @@ impl PressSchedule for TimerSchedule {
     fn next_press(&mut self, now: Duration) -> PressPlan {
         // The planned timeline never runs behind reality: whatever held the run
         // up moves it forward instead of being replayed as a catch-up burst.
-        // Intervals still accumulate from the plan, so they do not drift.
         self.next_at = self.next_at.max(now);
         let key = self.keys[self.key_index];
         self.key_index = (self.key_index + 1) % self.keys.len();
@@ -44,6 +43,13 @@ impl PressSchedule for TimerSchedule {
     }
 
     fn record_press(&mut self, at: Duration) {
-        self.next_at = self.next_at.max(at.saturating_add(self.interval));
+        // The accumulated plan is what sets the pace, so a press that ran a
+        // little late does not push the next one out and the interval never
+        // drifts. It is rebased only once the plan has fallen behind the press
+        // that really happened -- a pause leaves it stale that way -- and then
+        // the next press is a whole interval after that press.
+        if self.next_at < at {
+            self.next_at = at.saturating_add(self.interval);
+        }
     }
 }

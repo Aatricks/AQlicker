@@ -182,7 +182,8 @@ mod tests {
             self.presses += 1;
             let at = plan.target_offset.saturating_add(latency);
             schedule.record_press(at);
-            self.now = at;
+            // The worker plans the next press after releasing this one.
+            self.now = at.saturating_add(plan.hold_for);
             (plan, at)
         }
     }
@@ -219,7 +220,7 @@ mod tests {
         // Varying emission latency, the way a real run behaves. The cooldown is
         // measured from the press, so it must hold between actual emissions
         // however early or late any one of them lands.
-        let mut emitter = Emitter::new(&[0, 37, 5, 120, 12]);
+        let mut emitter = Emitter::new(&[0, 37, 5, 420, 12]);
         let emissions: Vec<_> = (0..50).map(|_| emitter.press(&mut schedule).1).collect();
 
         for window in emissions.windows(2) {
@@ -265,6 +266,23 @@ mod tests {
                 (LogicalKey::KeyA, 6_000),
             ]
         );
+    }
+
+    /// The natural twin of the timer resume case, and it has nothing to do with
+    /// cooldowns: a press held up past its own interval must still leave a full
+    /// interval before the next one, rather than the leftover of a plan made
+    /// before the hold-up.
+    #[test]
+    fn a_press_delayed_past_its_interval_still_leads_the_next_by_a_full_interval() {
+        let keys = cooling_entries(&[(LogicalKey::KeyA, 1, 0)]);
+        let mut schedule = NaturalSchedule::seeded(&keys, fixed_interval_settings(), 7);
+        // The third press is emitted 2 s late, as a focus pause would leave it.
+        let mut emitter = Emitter::new(&[0, 0, 2_000, 0, 0, 0]);
+        let emissions: Vec<_> = (0..6)
+            .map(|_| emitter.press(&mut schedule).1.as_millis() as u64)
+            .collect();
+
+        assert_eq!(emissions, [0, 100, 2_200, 2_300, 2_400, 2_500]);
     }
 
     /// A cooling key must drop out of the weighted draw without distorting the

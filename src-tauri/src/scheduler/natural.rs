@@ -307,8 +307,7 @@ impl PressSchedule for NaturalSchedule {
     fn next_press(&mut self, now: Duration) -> PressPlan {
         // The planned timeline never runs behind reality: whatever held the run
         // up -- a focus pause, a slow emission -- moves it forward instead of
-        // being replayed as a catch-up burst. Intervals still accumulate from
-        // the plan, so they do not drift.
+        // being replayed as a catch-up burst.
         self.next_at_ms = self.next_at_ms.max(now.as_millis() as u64);
         let key = self.choose_key();
         let interval_ms = self.next_interval();
@@ -322,13 +321,18 @@ impl PressSchedule for NaturalSchedule {
         plan
     }
 
-    /// The cooldown runs from the instant the key was really pressed, and the
-    /// next press stays a whole interval after it, in that same clock.
+    /// The cooldown runs from the instant the key was really pressed, in that
+    /// same clock.
     fn record_press(&mut self, at: Duration) {
         let at_ms = at.as_millis() as u64;
-        self.next_at_ms = self
-            .next_at_ms
-            .max(at_ms.saturating_add(self.pending_interval_ms));
+        // The accumulated plan is what sets the pace, so a press that ran a
+        // little late does not push the next one out and the interval never
+        // drifts. It is rebased only once the plan has fallen behind the press
+        // that really happened -- a pause leaves it stale that way -- and then
+        // the next press is a whole interval after that press.
+        if self.next_at_ms < at_ms {
+            self.next_at_ms = at_ms.saturating_add(self.pending_interval_ms);
+        }
         if let Some(index) = self.pending.take() {
             self.available_at_ms[index] =
                 at_ms.saturating_add(u64::from(self.keys[index].cooldown_ms));
