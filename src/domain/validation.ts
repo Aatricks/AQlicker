@@ -15,9 +15,13 @@ export function validateConfig(config: AppConfig): FieldErrors {
     errors.keys = "Each key can appear only once";
   }
 
-  config.keys.forEach(({ weight }, index) => {
+  config.keys.forEach(({ weight, cooldownMs }, index) => {
     if (!isWholeNumberInRange(weight, 1, 10)) {
       errors[`keys[${index}].weight`] = "Choose a weight from 1 to 10";
+    }
+    if (!isWholeNumberInRange(cooldownMs, 0, 60_000)) {
+      errors[`keys[${index}].cooldownMs`] =
+        "Choose a cooldown from 0 to 60,000 ms";
     }
   });
 

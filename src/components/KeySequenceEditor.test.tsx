@@ -5,7 +5,11 @@ import { KeySequenceEditor } from "./KeySequenceEditor";
 
 type KeyEntry = AppConfig["keys"][number];
 
-const entry = (key: KeyEntry["key"], weight = 1): KeyEntry => ({ key, weight });
+const entry = (
+  key: KeyEntry["key"],
+  weight = 1,
+  cooldownMs = 0,
+): KeyEntry => ({ key, weight, cooldownMs });
 
 describe("KeySequenceEditor", () => {
   it("captures a supported physical code and focuses rather than duplicates it", () => {
@@ -157,6 +161,38 @@ describe("KeySequenceEditor", () => {
       entry("KeyA"),
       entry("KeyC"),
     ]);
+  });
+
+  it("exposes a 0-60,000 ms cooldown only in Natural mode", () => {
+    const onChange = vi.fn();
+    const { rerender } = render(
+      <KeySequenceEditor
+        value={[entry("Space", 3, 250)]}
+        onChange={onChange}
+        mode="natural"
+      />,
+    );
+
+    const cooldown = screen.getByRole("spinbutton", {
+      name: "Space cooldown in milliseconds",
+    });
+    expect(cooldown).toHaveAttribute("min", "0");
+    expect(cooldown).toHaveAttribute("max", "60000");
+    fireEvent.change(cooldown, { target: { value: "1500" } });
+    expect(onChange).toHaveBeenLastCalledWith([entry("Space", 3, 1_500)]);
+
+    rerender(
+      <KeySequenceEditor
+        value={[entry("Space", 3, 250)]}
+        onChange={onChange}
+        mode="timer"
+      />,
+    );
+    expect(
+      screen.queryByRole("spinbutton", {
+        name: "Space cooldown in milliseconds",
+      }),
+    ).toBeNull();
   });
 
   it("exposes 1-10 frequency weights only in Natural mode", () => {

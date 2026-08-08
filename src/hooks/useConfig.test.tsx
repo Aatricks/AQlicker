@@ -8,7 +8,7 @@ function bootstrap(): BootstrapPayload {
   return {
     config: {
       ...DEFAULT_CONFIG,
-      keys: [{ key: "KeyA", weight: 1 }],
+      keys: [{ key: "KeyA", weight: 1, cooldownMs: 0 }],
     },
     recoveryNotice: null,
     permission: { granted: true, sameIntegrityOnly: false },

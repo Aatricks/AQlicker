@@ -673,7 +673,10 @@ fn execute_schedule(
                 Pause::DeadlineReached => {
                     return WorkerExit::Idle(StopReason::DurationComplete);
                 }
-                Pause::Ready(waited) => paused_for = paused_for.saturating_add(waited),
+                Pause::Ready(waited) => {
+                    paused_for = paused_for.saturating_add(waited);
+                    schedule.credit_pause(waited);
+                }
             }
         }
 
@@ -2090,6 +2093,84 @@ mod tests {
             self.events.lock().unwrap().push(format!("up:{key:?}"));
             Ok(())
         }
+    }
+
+    /// Natural mode with fixed 100 ms intervals, so a cooldown test reads the
+    /// worker's waiting instead of the sampler's variation.
+    fn cooling_request(cooldown_ms: u32, stop_after: u32) -> AppConfig {
+        AppConfig {
+            keys: vec![KeyEntry {
+                key: LogicalKey::KeyA,
+                weight: 1,
+                cooldown_ms,
+            }],
+            mode: Mode::Natural,
+            natural: crate::NaturalConfig {
+                naturalness: 50,
+                advanced: Some(crate::NaturalOverrides {
+                    min_interval_ms: 100,
+                    max_interval_ms: 100,
+                    burst_intensity: 0,
+                    pause_chance_percent: 0,
+                }),
+            },
+            stop_after: Some(stop_after),
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_cooldown_longer_than_the_run_ends_on_the_deadline_with_no_key_held() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let controller = RunController::for_test_with_clock(
+            Box::new(TimedRecordingSink {
+                events: Arc::clone(&events),
+            }),
+            Arc::new(VirtualClock::new()),
+        );
+
+        controller.start(cooling_request(60_000, 1)).unwrap();
+        let snapshot = controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(*events.lock().unwrap(), vec!["down:KeyA", "up:KeyA"]);
+        assert_eq!(snapshot.successful_presses, 1);
+        assert_eq!(snapshot.stop_reason, Some(StopReason::DurationComplete));
+        assert_eq!(snapshot.status, RunStatus::Idle);
+        assert_eq!(snapshot.error, None);
+    }
+
+    /// Cooldowns are wall-clock: a key that finished cooling while the run was
+    /// paused for its target application is selectable again on resume.
+    #[test]
+    fn a_key_that_cooled_through_a_focus_pause_is_available_on_resume() {
+        let mut script = vec![Some("com.apple.Safari"); 10];
+        script.push(Some("com.apple.TextEdit"));
+        let controller = controller_with_focus(
+            Box::new(TimedRecordingSink {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(VirtualClock::new()),
+            FakeFocus::new(&script),
+        );
+
+        // 10 polls x 200 ms = 2 s paused, twice the 1 s cooldown.
+        controller
+            .start(AppConfig {
+                target_app: Some(TargetApp {
+                    id: "com.apple.TextEdit".to_owned(),
+                    name: "TextEdit".to_owned(),
+                }),
+                ..cooling_request(1_000, 3)
+            })
+            .unwrap();
+        let snapshot = controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(snapshot.successful_presses, 2);
+        assert_eq!(snapshot.stop_reason, Some(StopReason::DurationComplete));
     }
 
     fn test_request(mode: Mode) -> AppConfig {

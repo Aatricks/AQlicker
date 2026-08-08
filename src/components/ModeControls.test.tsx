@@ -6,7 +6,7 @@ import { ModeControls } from "./ModeControls";
 function naturalConfig(): AppConfig {
   return {
     ...DEFAULT_CONFIG,
-    keys: [{ key: "KeyA", weight: 1 }],
+    keys: [{ key: "KeyA", weight: 1, cooldownMs: 0 }],
     mode: "natural",
     natural: {
       naturalness: 50,

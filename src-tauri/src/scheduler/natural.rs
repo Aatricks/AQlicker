@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -90,6 +90,13 @@ fn interpolate(start: u64, end: u64, naturalness: u8) -> u64 {
 
 pub struct NaturalSchedule {
     keys: Vec<KeyEntry>,
+    /// Wall-clock instant, parallel to `keys`, from which each key may be
+    /// selected again. A zero cooldown leaves this at or behind the current
+    /// instant forever, so the schedule behaves exactly as it did before.
+    available_at_ms: Vec<u64>,
+    /// Time the run spent paused for its target application. Schedule offsets
+    /// exclude it, wall-clock cooldowns include it.
+    pause_credit_ms: u64,
     settings: NaturalSettings,
     rng: ChaCha8Rng,
     target_offset_ms: u64,
@@ -150,6 +157,8 @@ impl NaturalSchedule {
         );
         Self {
             keys: keys.to_vec(),
+            available_at_ms: vec![0; keys.len()],
+            pause_credit_ms: 0,
             settings,
             rng: ChaCha8Rng::seed_from_u64(seed),
             target_offset_ms: 0,
@@ -162,31 +171,61 @@ impl NaturalSchedule {
         }
     }
 
+    const fn wall_now(&self) -> u64 {
+        self.target_offset_ms + self.pause_credit_ms
+    }
+
+    fn is_available(&self, index: usize) -> bool {
+        self.available_at_ms[index] <= self.wall_now()
+    }
+
     fn choose_key(&mut self) -> LogicalKey {
+        // The cooldown is a hard constraint: with every key cooling, the whole
+        // schedule waits for the earliest expiry rather than pressing early.
+        if !(0..self.keys.len()).any(|index| self.is_available(index)) {
+            let earliest = *self
+                .available_at_ms
+                .iter()
+                .min()
+                .expect("a natural schedule has at least one key");
+            self.target_offset_ms = earliest.saturating_sub(self.pause_credit_ms);
+        }
+        // The repeat cap is a soft constraint by comparison: it yields when the
+        // only key still available is the one it wants to hold back.
         let excluded = (self.keys.len() >= 2 && self.repeat_count >= 3)
             .then_some(self.last_key)
             .flatten();
-        let total_weight: u32 = self
-            .keys
+        let excluded = excluded.filter(|excluded| {
+            (0..self.keys.len())
+                .any(|index| self.is_available(index) && self.keys[index].key != *excluded)
+        });
+        let wall_now = self.wall_now();
+        let candidates: Vec<usize> = (0..self.keys.len())
+            .filter(|&index| {
+                self.available_at_ms[index] <= wall_now && Some(self.keys[index].key) != excluded
+            })
+            .collect();
+        let total_weight: u32 = candidates
             .iter()
-            .filter(|entry| Some(entry.key) != excluded)
-            .map(|entry| u32::from(entry.weight))
+            .map(|&index| u32::from(self.keys[index].weight))
             .sum();
         let mut draw = self.rng.random_range(0..total_weight);
-        let key = self
-            .keys
-            .iter()
-            .filter(|entry| Some(entry.key) != excluded)
-            .find_map(|entry| {
-                let weight = u32::from(entry.weight);
+        let index = candidates
+            .into_iter()
+            .find(|&index| {
+                let weight = u32::from(self.keys[index].weight);
                 if draw < weight {
-                    Some(entry.key)
+                    true
                 } else {
                     draw -= weight;
-                    None
+                    false
                 }
             })
             .expect("positive validated weights leave at least one candidate");
+        let key = self.keys[index].key;
+        self.available_at_ms[index] = self
+            .wall_now()
+            .saturating_add(u64::from(self.keys[index].cooldown_ms));
 
         if self.last_key == Some(key) {
             self.repeat_count = self.repeat_count.saturating_add(1);
@@ -268,6 +307,17 @@ impl NaturalSchedule {
 }
 
 impl PressSchedule for NaturalSchedule {
+    /// Credits the pause so a key that finished cooling while the run was held
+    /// is selectable again on resume. The press already planned when the pause
+    /// began keeps the instant it was planned for, so its own cooldown starts
+    /// up to one pause early; that is a single press, and correcting it would
+    /// need a second callback at emission time.
+    fn credit_pause(&mut self, waited: Duration) {
+        self.pause_credit_ms = self
+            .pause_credit_ms
+            .saturating_add(waited.as_millis() as u64);
+    }
+
     fn next_press(&mut self) -> PressPlan {
         let key = self.choose_key();
         let interval_ms = self.next_interval();

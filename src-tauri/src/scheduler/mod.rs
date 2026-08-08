@@ -27,6 +27,10 @@ impl PressPlan {
 
 pub trait PressSchedule: Send {
     fn next_press(&mut self) -> PressPlan;
+
+    /// Reports time the run spent paused for its target application. Schedules
+    /// with a wall-clock constraint credit it; the timer schedule has none.
+    fn credit_pause(&mut self, _waited: Duration) {}
 }
 
 pub fn is_before_deadline(plan: &PressPlan, deadline: Option<Duration>) -> bool {
@@ -44,7 +48,11 @@ mod tests {
     fn entries(entries: &[(LogicalKey, u8)]) -> Vec<KeyEntry> {
         entries
             .iter()
-            .map(|&(key, weight)| KeyEntry { key, weight })
+            .map(|&(key, weight)| KeyEntry {
+                key,
+                weight,
+                cooldown_ms: 0,
+            })
             .collect()
     }
 
@@ -76,6 +84,174 @@ mod tests {
                 .windows(4)
                 .any(|window| window.iter().all(|plan| plan.key == window[0].key))
         );
+    }
+
+    /// Golden record of a seeded natural run. Any change that shifts a random
+    /// draw or an offset shows up here, so it pins "no cooldown behaves exactly
+    /// as it did before cooldowns existed".
+    #[test]
+    fn natural_without_cooldowns_matches_its_recorded_golden_run() {
+        let keys = entries(&[
+            (LogicalKey::KeyA, 1),
+            (LogicalKey::KeyB, 3),
+            (LogicalKey::KeyC, 6),
+        ]);
+        let mut schedule = NaturalSchedule::seeded(&keys, NaturalSettings::from_slider(50), 0x601D);
+        let plans: Vec<(LogicalKey, u64, u64)> = (0..20)
+            .map(|_| {
+                let plan = schedule.next_press();
+                (
+                    plan.key,
+                    plan.target_offset.as_millis() as u64,
+                    plan.hold_for.as_millis() as u64,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            plans,
+            [
+                (LogicalKey::KeyC, 0, 97),
+                (LogicalKey::KeyC, 142, 52),
+                (LogicalKey::KeyC, 264, 66),
+                (LogicalKey::KeyB, 373, 89),
+                (LogicalKey::KeyC, 709, 74),
+                (LogicalKey::KeyB, 903, 47),
+                (LogicalKey::KeyC, 1_056, 49),
+                (LogicalKey::KeyC, 1_204, 59),
+                (LogicalKey::KeyC, 1_351, 82),
+                (LogicalKey::KeyB, 1_587, 91),
+                (LogicalKey::KeyB, 1_755, 89),
+                (LogicalKey::KeyA, 1_946, 61),
+                (LogicalKey::KeyB, 2_091, 38),
+                (LogicalKey::KeyC, 2_331, 42),
+                (LogicalKey::KeyC, 3_015, 60),
+                (LogicalKey::KeyC, 3_258, 73),
+                (LogicalKey::KeyB, 3_475, 40),
+                (LogicalKey::KeyA, 3_637, 65),
+                (LogicalKey::KeyB, 3_964, 50),
+                (LogicalKey::KeyC, 4_284, 90),
+            ]
+        );
+    }
+
+    fn cooling_entries(entries: &[(LogicalKey, u8, u32)]) -> Vec<KeyEntry> {
+        entries
+            .iter()
+            .map(|&(key, weight, cooldown_ms)| KeyEntry {
+                key,
+                weight,
+                cooldown_ms,
+            })
+            .collect()
+    }
+
+    /// Fixed 100 ms intervals with no bursts and no pauses, so a cooldown test
+    /// reads the schedule's timing decisions instead of its sampling.
+    fn fixed_interval_settings() -> NaturalSettings {
+        NaturalSettings::from_config(&NaturalConfig {
+            naturalness: 50,
+            advanced: Some(NaturalOverrides {
+                min_interval_ms: 100,
+                max_interval_ms: 100,
+                burst_intensity: 0,
+                pause_chance_percent: 0,
+            }),
+        })
+    }
+
+    #[test]
+    fn a_cooling_single_key_paces_presses_to_its_cooldown() {
+        let keys = cooling_entries(&[(LogicalKey::KeyA, 1, 1_000)]);
+        let mut schedule = NaturalSchedule::seeded(&keys, NaturalSettings::from_slider(50), 5);
+        let plans: Vec<_> = (0..50).map(|_| schedule.next_press()).collect();
+
+        for window in plans.windows(2) {
+            let gap = window[1].target_offset - window[0].target_offset;
+            assert!(
+                gap >= Duration::from_millis(1_000),
+                "gap {gap:?} is shorter than the cooldown"
+            );
+        }
+        assert!(
+            plans
+                .windows(2)
+                .any(|window| window[1].target_offset - window[0].target_offset
+                    == Duration::from_millis(1_000)),
+            "the cooldown must set the pace, not merely bound it"
+        );
+    }
+
+    #[test]
+    fn every_key_cooling_waits_for_the_earliest_expiry() {
+        let keys = cooling_entries(&[(LogicalKey::KeyA, 1, 1_000), (LogicalKey::KeyB, 1, 5_000)]);
+        let mut schedule = NaturalSchedule::seeded(&keys, fixed_interval_settings(), 3);
+        let plans: Vec<_> = (0..9)
+            .map(|_| {
+                let plan = schedule.next_press();
+                (plan.key, plan.target_offset.as_millis() as u64)
+            })
+            .collect();
+
+        assert_eq!(
+            plans,
+            [
+                (LogicalKey::KeyA, 0),
+                (LogicalKey::KeyB, 100),
+                // Both keys are cooling from here on, so every press waits for
+                // the earliest expiry and takes the key that expired.
+                (LogicalKey::KeyA, 1_000),
+                (LogicalKey::KeyA, 2_000),
+                (LogicalKey::KeyA, 3_000),
+                (LogicalKey::KeyA, 4_000),
+                (LogicalKey::KeyA, 5_000),
+                (LogicalKey::KeyB, 5_100),
+                (LogicalKey::KeyA, 6_000),
+            ]
+        );
+    }
+
+    /// A cooling key must drop out of the weighted draw without distorting the
+    /// keys that remain: their shares have to match the repeat-capped reference
+    /// for their own weights alone.
+    #[test]
+    fn a_cooling_key_renormalizes_the_weights_of_the_keys_that_remain() {
+        let keys = cooling_entries(&[
+            (LogicalKey::KeyA, 1, 0),
+            (LogicalKey::KeyB, 3, 0),
+            (LogicalKey::KeyC, 6, 60_000),
+        ]);
+        let expected = repeat_capped_reference(&[1, 3]);
+        let mut schedule = NaturalSchedule::seeded(&keys, NaturalSettings::from_slider(50), 0xC001);
+        let mut counts = [0_u64; 3];
+        for _ in 0..100_000 {
+            let index = match schedule.next_press().key {
+                LogicalKey::KeyA => 0,
+                LogicalKey::KeyB => 1,
+                LogicalKey::KeyC => 2,
+                key => panic!("unexpected key {key:?}"),
+            };
+            counts[index] += 1;
+        }
+
+        // The 60 s cooldown lets KeyC back in roughly once a minute of schedule
+        // time. That is well under 1% of the presses, so the KeyA-to-KeyB chain
+        // it interrupts stays inside the 1 percentage point tolerance.
+        assert!(
+            counts[2] * 100 < counts.iter().sum::<u64>(),
+            "KeyC took {} of {} presses",
+            counts[2],
+            counts.iter().sum::<u64>()
+        );
+        let uncooled = (counts[0] + counts[1]) as f64;
+        for index in 0..2 {
+            let observed = counts[index] as f64 / uncooled;
+            assert!(
+                (observed - expected[index]).abs() <= 0.01,
+                "key {index}: observed {observed:.5}, expected {0:.5}",
+                expected[index]
+            );
+        }
     }
 
     #[test]

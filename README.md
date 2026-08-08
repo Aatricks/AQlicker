@@ -31,6 +31,8 @@ Builds are unsigned and not notarized. macOS Gatekeeper will complain, and Windo
 
 **Natural** picks keys at random using per-key weights from 1 to 10, so a key with weight 3 comes up about three times as often as one with weight 1. Intervals vary, with occasional short bursts and pauses. One slider handles this for most cases; an advanced section exposes the minimum and maximum interval, burst intensity, and pause chance (capped at 25%).
 
+Each key in natural mode also has a cooldown, from 0 to 60,000 ms. It is 0 by default, which means no cooldown. After a key is pressed, it is not picked again until its cooldown has elapsed. The other keys stay available while it cools, and their weights are shared out among them. When every selected key is cooling, the run waits for the first one to come back and presses that key, so a cooldown is never cut short. Waiting still counts toward the stop-after duration, and a cooldown longer than the remaining duration ends the run on its deadline with no key held. Cooldowns run against the clock, so time the run spends paused waiting for a target application counts toward them. Timer mode is unaffected.
+
 Both modes accept an optional stop-after duration, from 1 second to 24 hours.
 
 ## Stopping a run

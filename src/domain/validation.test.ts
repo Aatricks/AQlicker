@@ -5,7 +5,7 @@ import { validateConfig, validateConfigForStart } from "./validation";
 function configWith(overrides: Partial<AppConfig>): AppConfig {
   return {
     ...DEFAULT_CONFIG,
-    keys: [{ key: "KeyA", weight: 1 }],
+    keys: [{ key: "KeyA", weight: 1, cooldownMs: 0 }],
     ...overrides,
   };
 }
@@ -14,8 +14,8 @@ describe("configuration draft validation", () => {
   it("reports duplicate, duration, and mode-specific field errors", () => {
     const invalid = configWith({
       keys: [
-        { key: "KeyA", weight: 0 },
-        { key: "KeyA", weight: 1 },
+        { key: "KeyA", weight: 0, cooldownMs: 60_001 },
+        { key: "KeyA", weight: 1, cooldownMs: 0 },
       ],
       timer: { intervalMs: 60_001 },
       stopAfter: 86_401,
@@ -24,6 +24,7 @@ describe("configuration draft validation", () => {
     expect(validateConfig(invalid)).toMatchObject({
       keys: "Each key can appear only once",
       "keys[0].weight": "Choose a weight from 1 to 10",
+      "keys[0].cooldownMs": "Choose a cooldown from 0 to 60,000 ms",
       "timer.intervalMs": "Choose an interval from 40 to 60,000 ms",
       stopAfter: "Choose a duration from 1 second to 24 hours",
     });

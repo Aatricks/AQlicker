@@ -110,6 +110,21 @@ pub fn migrate_to_current(document: Value) -> Result<AppConfig, ConfigRepository
         document["targetApp"] = Value::Null;
     }
 
+    // v2 knew nothing about per-key cooldowns, so every key migrates to v3 with
+    // its cooldown switched off. A `keys` value that is not an array of objects
+    // is left untouched and falls through to `InvalidConfig`, which keeps the
+    // corrupt-file backup path in charge of it.
+    if document.get("schemaVersion").and_then(Value::as_u64) == Some(2) {
+        document["schemaVersion"] = Value::from(3);
+        if let Some(keys) = document.get_mut("keys").and_then(Value::as_array_mut) {
+            for entry in keys {
+                if let Some(entry) = entry.as_object_mut() {
+                    entry.insert("cooldownMs".to_owned(), Value::from(0));
+                }
+            }
+        }
+    }
+
     let schema_version = document
         .get("schemaVersion")
         .and_then(Value::as_u64)
@@ -211,13 +226,56 @@ mod tests {
         assert_eq!(loaded.config.target_app, None);
         assert_eq!(loaded.config.natural.naturalness, 65);
         assert_eq!(loaded.config.stop_after, Some(3_600));
+        assert!(
+            loaded
+                .config
+                .keys
+                .iter()
+                .all(|entry| entry.cooldown_ms == 0)
+        );
+    }
+
+    #[test]
+    fn migration_loads_a_v2_file_with_every_cooldown_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILE_NAME);
+        fs::write(&path, include_str!("../tests/fixtures/config-v2.json")).unwrap();
+
+        let loaded = ConfigRepository::new(directory.path()).load().unwrap();
+
+        assert!(loaded.notice.is_none());
+        assert_eq!(loaded.config.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(loaded.config.keys.len(), 6);
+        assert!(
+            loaded
+                .config
+                .keys
+                .iter()
+                .all(|entry| entry.cooldown_ms == 0)
+        );
+        assert_eq!(
+            loaded.config.target_app.as_ref().map(|app| app.id.as_str()),
+            Some("com.apple.TextEdit")
+        );
+    }
+
+    #[test]
+    fn migration_leaves_a_corrupt_v2_file_to_the_backup_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILE_NAME);
+        fs::write(&path, r#"{"schemaVersion":2,"keys":"not-an-array"}"#).unwrap();
+
+        let loaded = ConfigRepository::new(directory.path()).load().unwrap();
+
+        assert_eq!(loaded.notice.unwrap().code, "corrupt-config-recovered");
+        assert!(!path.exists());
     }
 
     #[test]
     fn persistence_rejects_future_schema_without_replacing_the_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(CONFIG_FILE_NAME);
-        fs::write(&path, r#"{"schemaVersion":3}"#).unwrap();
+        fs::write(&path, r#"{"schemaVersion":4}"#).unwrap();
 
         let error = ConfigRepository::new(directory.path()).load().unwrap_err();
 

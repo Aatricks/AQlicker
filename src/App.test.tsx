@@ -59,7 +59,7 @@ function fakeApi(overrides: Partial<BootstrapPayload> = {}) {
 function naturalConfig(): AppConfig {
   return {
     ...DEFAULT_CONFIG,
-    keys: [{ key: "Space", weight: 3 }],
+    keys: [{ key: "Space", weight: 3, cooldownMs: 0 }],
     mode: "natural",
     stopAfter: 3_600,
   };
@@ -110,7 +110,7 @@ describe("App", () => {
     render(
       <App
         api={
-          fakeApi({ config: { ...DEFAULT_CONFIG, keys: [{ key: "Space", weight: 3 }] } })
+          fakeApi({ config: { ...DEFAULT_CONFIG, keys: [{ key: "Space", weight: 3, cooldownMs: 0 }] } })
             .api
         }
       />,

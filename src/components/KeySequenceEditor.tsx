@@ -114,7 +114,7 @@ export function KeySequenceEditor({
       chipRefs.current.get(key)?.focus();
       return;
     }
-    onChange([...value, { key, weight: 1 }]);
+    onChange([...value, { key, weight: 1, cooldownMs: 0 }]);
     closePicker();
   };
 
@@ -200,6 +200,7 @@ export function KeySequenceEditor({
           {value.map((entry, index) => {
             const label = keyLabel(entry.key);
             const weightError = errors[`keys[${index}].weight`];
+            const cooldownError = errors[`keys[${index}].cooldownMs`];
             return (
               <li
                 className="key-card"
@@ -222,37 +223,70 @@ export function KeySequenceEditor({
                 </span>
                 <span className="key-name">{label}</span>
                 {mode === "natural" && (
-                  <label className="weight-control">
-                    <span>{label} frequency weight</span>
-                    <input
-                      aria-describedby={
-                        weightError ? `weight-error-${entry.key}` : undefined
-                      }
-                      aria-invalid={Boolean(weightError)}
-                      aria-label={`${label} frequency weight`}
-                      disabled={disabled}
-                      max={10}
-                      min={1}
-                      onChange={(event) => {
-                        const next = [...value];
-                        next[index] = {
-                          ...entry,
-                          weight: Number(event.currentTarget.value),
-                        };
-                        onChange(next);
-                      }}
-                      type="number"
-                      value={entry.weight}
-                    />
-                    {weightError && (
-                      <span
-                        className="field-error"
-                        id={`weight-error-${entry.key}`}
-                      >
-                        {weightError}
-                      </span>
-                    )}
-                  </label>
+                  <div className="key-controls">
+                    <label className="weight-control">
+                      <span>{label} frequency weight</span>
+                      <input
+                        aria-describedby={
+                          weightError ? `weight-error-${entry.key}` : undefined
+                        }
+                        aria-invalid={Boolean(weightError)}
+                        aria-label={`${label} frequency weight`}
+                        disabled={disabled}
+                        max={10}
+                        min={1}
+                        onChange={(event) => {
+                          const next = [...value];
+                          next[index] = {
+                            ...entry,
+                            weight: Number(event.currentTarget.value),
+                          };
+                          onChange(next);
+                        }}
+                        type="number"
+                        value={entry.weight}
+                      />
+                      {weightError && (
+                        <span
+                          className="field-error"
+                          id={`weight-error-${entry.key}`}
+                        >
+                          {weightError}
+                        </span>
+                      )}
+                    </label>
+                    <label className="weight-control cooldown-control">
+                      <span>{label} cooldown (ms)</span>
+                      <input
+                        aria-describedby={
+                          cooldownError ? `cooldown-error-${entry.key}` : undefined
+                        }
+                        aria-invalid={Boolean(cooldownError)}
+                        aria-label={`${label} cooldown in milliseconds`}
+                        disabled={disabled}
+                        max={60_000}
+                        min={0}
+                        onChange={(event) => {
+                          const next = [...value];
+                          next[index] = {
+                            ...entry,
+                            cooldownMs: Number(event.currentTarget.value),
+                          };
+                          onChange(next);
+                        }}
+                        type="number"
+                        value={entry.cooldownMs}
+                      />
+                      {cooldownError && (
+                        <span
+                          className="field-error"
+                          id={`cooldown-error-${entry.key}`}
+                        >
+                          {cooldownError}
+                        </span>
+                      )}
+                    </label>
+                  </div>
                 )}
                 <div className="key-actions">
                   <button

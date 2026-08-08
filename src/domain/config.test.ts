@@ -1,5 +1,6 @@
 import fixtureV1 from "../../src-tauri/tests/fixtures/config-v1.json";
-import fixture from "../../src-tauri/tests/fixtures/config-v2.json";
+import fixtureV2 from "../../src-tauri/tests/fixtures/config-v2.json";
+import fixture from "../../src-tauri/tests/fixtures/config-v3.json";
 import logicalKeys from "../../src-tauri/tests/fixtures/logical-keys.json";
 import { describe, expect, it } from "vitest";
 import {
@@ -23,18 +24,23 @@ describe("configuration contract", () => {
     expect(fixtureV1).not.toHaveProperty("targetApp");
   });
 
-  it("deserializes the v2 fixture with its exact camelCase schema", () => {
+  it("keeps the v2 fixture readable as the pre-cooldown schema", () => {
+    expect(fixtureV2.schemaVersion).toBe(2);
+    expect(fixtureV2.keys.every((entry) => !("cooldownMs" in entry))).toBe(true);
+  });
+
+  it("deserializes the v3 fixture with its exact camelCase schema", () => {
     const config = fixture as AppConfig;
 
     expect(config).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       keys: [
-        { key: "KeyA", weight: 3 },
-        { key: "Digit1", weight: 2 },
-        { key: "F12", weight: 1 },
-        { key: "ArrowUp", weight: 4 },
-        { key: "Space", weight: 5 },
-        { key: "Backquote", weight: 1 },
+        { key: "KeyA", weight: 3, cooldownMs: 0 },
+        { key: "Digit1", weight: 2, cooldownMs: 250 },
+        { key: "F12", weight: 1, cooldownMs: 60_000 },
+        { key: "ArrowUp", weight: 4, cooldownMs: 0 },
+        { key: "Space", weight: 5, cooldownMs: 1_500 },
+        { key: "Backquote", weight: 1, cooldownMs: 0 },
       ],
       mode: "natural",
       timer: { intervalMs: 120 },
@@ -58,8 +64,8 @@ describe("configuration contract", () => {
     const config: AppConfig = {
       ...DEFAULT_CONFIG,
       keys: [
-        { key: "KeyA", weight: 0 },
-        { key: "KeyA", weight: 1 },
+        { key: "KeyA", weight: 0, cooldownMs: 60_001 },
+        { key: "KeyA", weight: 1, cooldownMs: 0 },
       ],
       timer: { intervalMs: 60_001 },
       natural: {
@@ -77,6 +83,7 @@ describe("configuration contract", () => {
     expect(validateConfig(config)).toEqual(expect.arrayContaining([
       { field: "keys", code: "duplicate" },
       { field: "keys[0].weight", code: "range" },
+      { field: "keys[0].cooldownMs", code: "range" },
       { field: "timer.intervalMs", code: "range" },
       { field: "natural.advanced.minIntervalMs", code: "range" },
       { field: "natural.advanced.maxIntervalMs", code: "range" },
@@ -84,6 +91,22 @@ describe("configuration contract", () => {
       { field: "stopAfter", code: "range" },
     ]));
     expect(validateConfigForStart(DEFAULT_CONFIG)).toContainEqual({ field: "keys", code: "required" });
+  });
+
+  it("bounds the per-key cooldown from 0 to 60,000 ms", () => {
+    const configWithCooldown = (cooldownMs: number): AppConfig => ({
+      ...DEFAULT_CONFIG,
+      keys: [{ key: "KeyA", weight: 1, cooldownMs }],
+    });
+
+    expect(validateConfig(configWithCooldown(0))).toEqual([]);
+    expect(validateConfig(configWithCooldown(60_000))).toEqual([]);
+    for (const cooldownMs of [-1, 0.5, 60_001]) {
+      expect(validateConfig(configWithCooldown(cooldownMs))).toContainEqual({
+        field: "keys[0].cooldownMs",
+        code: "range",
+      });
+    }
   });
 
   it("rejects a target application without a stable identifier", () => {

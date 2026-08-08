@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::key::LogicalKey;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+const MAX_COOLDOWN_MS: u32 = 60_000;
 const MIN_INTERVAL_MS: u32 = 40;
 const MAX_TIMER_INTERVAL_MS: u32 = 60_000;
 const MAX_NATURAL_INTERVAL_MS: u32 = 5_000;
@@ -64,6 +65,12 @@ impl AppConfig {
             if !(1..=10).contains(&entry.weight) {
                 errors.push(ValidationError::new(
                     format!("keys[{index}].weight"),
+                    "range",
+                ));
+            }
+            if entry.cooldown_ms > MAX_COOLDOWN_MS {
+                errors.push(ValidationError::new(
+                    format!("keys[{index}].cooldownMs"),
                     "range",
                 ));
             }
@@ -145,14 +152,23 @@ pub struct TargetApp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct KeyEntry {
     pub key: LogicalKey,
     pub weight: u8,
+    /// Natural mode only. Milliseconds this key stays unselectable after it is
+    /// pressed. `0` disables the cooldown, which is what every pre-v3 file
+    /// migrates to.
+    pub cooldown_ms: u32,
 }
 
 impl KeyEntry {
     pub const fn new(key: LogicalKey) -> Self {
-        Self { key, weight: 1 }
+        Self {
+            key,
+            weight: 1,
+            cooldown_ms: 0,
+        }
     }
 }
 
@@ -211,6 +227,7 @@ mod tests {
                 KeyEntry {
                     key: LogicalKey::KeyA,
                     weight: 0,
+                    cooldown_ms: 0,
                 },
                 KeyEntry::new(LogicalKey::KeyA),
             ],
@@ -266,6 +283,28 @@ mod tests {
                 .iter()
                 .any(|error| error.field == "keys" && error.code == "required")
         );
+    }
+
+    #[test]
+    fn config_validation_bounds_the_per_key_cooldown() {
+        let config_with_cooldown = |cooldown_ms| AppConfig {
+            keys: vec![KeyEntry {
+                key: LogicalKey::KeyA,
+                weight: 1,
+                cooldown_ms,
+            }],
+            ..AppConfig::default()
+        };
+
+        assert!(config_with_cooldown(0).validate().is_empty());
+        assert!(config_with_cooldown(60_000).validate().is_empty());
+        assert!(
+            config_with_cooldown(60_001)
+                .validate()
+                .iter()
+                .any(|error| error.field == "keys[0].cooldownMs" && error.code == "range")
+        );
+        assert_eq!(KeyEntry::new(LogicalKey::KeyA).cooldown_ms, 0);
     }
 
     #[test]

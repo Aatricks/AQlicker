@@ -13,6 +13,7 @@ export type LogicalKey = (typeof LOGICAL_KEYS)[number];
 export type Mode = "timer" | "natural";
 
 const MAX_PAUSE_CHANCE_PERCENT = 25;
+const MAX_COOLDOWN_MS = 60_000;
 
 export interface NaturalOverrides {
   minIntervalMs: number;
@@ -28,8 +29,9 @@ export interface TargetApp {
 }
 
 export interface AppConfig {
-  schemaVersion: 2;
-  keys: Array<{ key: LogicalKey; weight: number }>;
+  schemaVersion: 3;
+  /** `cooldownMs` is Natural mode only: 0 disables the cooldown. */
+  keys: Array<{ key: LogicalKey; weight: number; cooldownMs: number }>;
   mode: Mode;
   timer: { intervalMs: number };
   natural: { naturalness: number; advanced: NaturalOverrides | null };
@@ -44,7 +46,7 @@ export interface ValidationError {
 }
 
 export const DEFAULT_CONFIG: AppConfig = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   keys: [],
   mode: "timer",
   timer: { intervalMs: 100 },
@@ -69,6 +71,9 @@ export function validateConfig(config: AppConfig): ValidationError[] {
   config.keys.forEach((entry, index) => {
     if (!Number.isInteger(entry.weight) || entry.weight < 1 || entry.weight > 10) {
       errors.push({ field: `keys[${index}].weight`, code: "range" });
+    }
+    if (!Number.isInteger(entry.cooldownMs) || entry.cooldownMs < 0 || entry.cooldownMs > MAX_COOLDOWN_MS) {
+      errors.push({ field: `keys[${index}].cooldownMs`, code: "range" });
     }
   });
 

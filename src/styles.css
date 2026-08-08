@@ -290,9 +290,22 @@ ul {
   font-weight: 750;
 }
 
+.key-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .weight-control {
   grid-template-columns: minmax(0, 1fr) 58px;
   align-items: center;
+}
+
+/* Five digits plus the spinner do not fit the weight field. */
+.cooldown-control {
+  grid-template-columns: minmax(0, 1fr) 80px;
 }
 
 .weight-control > span {
@@ -566,7 +579,7 @@ ul {
     grid-template-columns: 16px minmax(40px, 1fr) auto;
   }
 
-  .weight-control {
+  .key-controls {
     grid-column: 2 / -1;
     grid-row: 2;
   }
