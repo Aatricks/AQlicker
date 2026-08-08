@@ -343,6 +343,32 @@ describe("useConfig", () => {
     expect(result.current.saveError).toBeNull();
   });
 
+  it("clears a terminal save error when the draft returns to the durable config", async () => {
+    const payload = bootstrap();
+    const api = fakeApi(payload);
+    vi.mocked(api.saveConfig).mockRejectedValueOnce(new Error("save failed"));
+    const { result } = renderHook(() => useConfig(api));
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+    vi.useFakeTimers();
+
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        timer: { intervalMs: 125 },
+      }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(api.saveConfig).toHaveBeenCalledTimes(1);
+    expect(result.current.saveError).toBe("save failed");
+
+    act(() => {
+      result.current.updateConfig(payload.config);
+    });
+
+    expect(api.saveConfig).toHaveBeenCalledTimes(1);
+    expect(result.current.saveError).toBeNull();
+  });
+
   it("does not save again when the latest draft is already settled", async () => {
     const api = fakeApi();
     const { result } = renderHook(() => useConfig(api));

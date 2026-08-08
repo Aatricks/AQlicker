@@ -123,6 +123,7 @@ export function useConfig(api: AqlickerApi = aqlickerApi) {
       !queuedSave.current &&
       serialized === persistedConfig.current
     ) {
+      setSaveError(null);
       return;
     }
 
