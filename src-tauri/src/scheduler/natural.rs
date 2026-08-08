@@ -182,6 +182,9 @@ impl NaturalSchedule {
     fn choose_key(&mut self) -> LogicalKey {
         // The cooldown is a hard constraint: with every key cooling, the whole
         // schedule waits for the earliest expiry rather than pressing early.
+        // Reaching this branch means every expiry is past `wall_now`, so the
+        // earliest of them is always ahead of the current offset: the offset
+        // only ever moves forward, never back onto an instant already waited out.
         if !(0..self.keys.len()).any(|index| self.is_available(index)) {
             let earliest = *self
                 .available_at_ms
