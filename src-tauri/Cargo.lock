@@ -52,6 +52,8 @@ name = "aqlicker"
 version = "0.1.0"
 dependencies = [
  "atomic-write-file",
+ "rand",
+ "rand_chacha",
  "serde",
  "serde_json",
  "tauri",

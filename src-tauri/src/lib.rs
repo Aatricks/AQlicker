@@ -1,6 +1,7 @@
 pub mod config;
 pub mod key;
 pub mod persistence;
+pub mod scheduler;
 
 pub use config::{
     AppConfig, CURRENT_SCHEMA_VERSION, KeyEntry, Mode, NaturalConfig, NaturalOverrides,
