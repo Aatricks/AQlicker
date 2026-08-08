@@ -334,7 +334,22 @@ impl Drop for RunController {
 
 enum WorkerExit {
     Idle(StopReason),
-    Failed(RunError, StopReason),
+    Failed {
+        error: RunError,
+        reason: StopReason,
+        phase: FailurePhase,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailurePhase {
+    Runtime,
+    Cleanup,
+}
+
+struct PressState {
+    down_key: Option<LogicalKey>,
+    failure_phase: FailurePhase,
 }
 
 fn worker_main(
@@ -345,7 +360,10 @@ fn worker_main(
     deadline: Option<Duration>,
     clock: Arc<dyn Clock>,
 ) {
-    let mut down_key = None;
+    let mut press_state = PressState {
+        down_key: None,
+        failure_phase: FailurePhase::Runtime,
+    };
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         execute_schedule(
             &sink,
@@ -354,19 +372,20 @@ fn worker_main(
             schedule.as_mut(),
             deadline,
             clock.as_ref(),
-            &mut down_key,
+            &mut press_state,
         )
     }));
     let mut exit = match outcome {
         Ok(exit) => exit,
-        Err(_) => WorkerExit::Failed(
-            RunError {
+        Err(_) => WorkerExit::Failed {
+            error: RunError {
                 code: "worker-panic".to_owned(),
-                key: down_key,
+                key: press_state.down_key,
                 message: "input worker panicked".to_owned(),
             },
-            StopReason::WorkerPanic,
-        ),
+            reason: StopReason::WorkerPanic,
+            phase: press_state.failure_phase,
+        },
     };
 
     if matches!(exit, WorkerExit::Idle(_)) {
@@ -375,19 +394,22 @@ fn worker_main(
             state.snapshot.status = RunStatus::Stopping;
         }
     }
-    if let Some(key) = down_key.take() {
+    if let Some(key) = press_state.down_key.take() {
         match panic::catch_unwind(AssertUnwindSafe(|| lock(&sink).key_up(key))) {
             Ok(Ok(())) => {}
-            Ok(Err(failure)) => exit = input_failure(key, failure),
+            Ok(Err(failure)) => {
+                exit = input_failure(key, failure, FailurePhase::Cleanup);
+            }
             Err(_) => {
-                exit = WorkerExit::Failed(
-                    RunError {
+                exit = WorkerExit::Failed {
+                    error: RunError {
                         code: "worker-panic".to_owned(),
                         key: Some(key),
                         message: "input worker panicked during key cleanup".to_owned(),
                     },
-                    StopReason::WorkerPanic,
-                );
+                    reason: StopReason::WorkerPanic,
+                    phase: FailurePhase::Cleanup,
+                };
             }
         }
     }
@@ -401,9 +423,10 @@ fn execute_schedule(
     schedule: &mut dyn PressSchedule,
     deadline: Option<Duration>,
     clock: &dyn Clock,
-    down_key: &mut Option<LogicalKey>,
+    press_state: &mut PressState,
 ) -> WorkerExit {
     loop {
+        press_state.failure_phase = FailurePhase::Runtime;
         let plan = schedule.next_press();
         if !is_before_deadline(&plan, deadline) {
             if deadline.is_some_and(|deadline| clock.wait_until(deadline, receiver)) {
@@ -425,31 +448,34 @@ fn execute_schedule(
         }
 
         if let Err(failure) = lock(sink).key_down(plan.key) {
-            return input_failure(plan.key, failure);
+            return input_failure(plan.key, failure, FailurePhase::Runtime);
         }
-        *down_key = Some(plan.key);
+        press_state.down_key = Some(plan.key);
         if clock.wait_until(plan.target_offset.saturating_add(plan.hold_for), receiver) {
             return WorkerExit::Idle(StopReason::Requested);
         }
+        press_state.failure_phase = FailurePhase::Cleanup;
         if let Err(failure) = lock(sink).key_up(plan.key) {
-            return input_failure(plan.key, failure);
+            return input_failure(plan.key, failure, FailurePhase::Cleanup);
         }
-        *down_key = None;
+        press_state.down_key = None;
+        press_state.failure_phase = FailurePhase::Runtime;
         let mut state = lock(&shared.state);
         state.snapshot.successful_presses = state.snapshot.successful_presses.saturating_add(1);
         state.snapshot.elapsed_ms = duration_millis(clock.elapsed());
     }
 }
 
-fn input_failure(key: LogicalKey, failure: InputFailure) -> WorkerExit {
-    WorkerExit::Failed(
-        RunError {
+fn input_failure(key: LogicalKey, failure: InputFailure, phase: FailurePhase) -> WorkerExit {
+    WorkerExit::Failed {
+        error: RunError {
             code: "input-failure".to_owned(),
             key: Some(key),
             message: failure.message,
         },
-        StopReason::InputFailure,
-    )
+        reason: StopReason::InputFailure,
+        phase,
+    }
 }
 
 fn finish(shared: &SharedState, exit: WorkerExit, elapsed: Duration) {
@@ -464,8 +490,17 @@ fn finish(shared: &SharedState, exit: WorkerExit, elapsed: Duration) {
             state.snapshot.status = RunStatus::Idle;
             state.snapshot.stop_reason = Some(reason);
         }
-        WorkerExit::Failed(error, reason) => {
-            state.snapshot.status = RunStatus::Failed;
+        WorkerExit::Failed {
+            error,
+            reason,
+            phase,
+        } => {
+            state.snapshot.status =
+                if state.snapshot.status == RunStatus::Stopping && phase == FailurePhase::Runtime {
+                    RunStatus::Idle
+                } else {
+                    RunStatus::Failed
+                };
             state.snapshot.stop_reason = Some(reason);
             state.snapshot.error = Some(error);
         }
@@ -873,6 +908,177 @@ mod tests {
     enum FailurePoint {
         Down,
         FirstUp,
+    }
+
+    #[derive(Clone, Copy)]
+    enum StopRaceOutcome {
+        KeyDownFailure,
+        CleanupSuccess,
+        CleanupFailure,
+    }
+
+    struct StopRaceSink {
+        outcome: StopRaceOutcome,
+        events: Arc<Mutex<Vec<String>>>,
+        down_entered: Arc<(Mutex<bool>, Condvar)>,
+        down_returned: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl InputSink for StopRaceSink {
+        fn key_down(&mut self, key: LogicalKey) -> Result<(), InputFailure> {
+            self.events.lock().unwrap().push(format!("down:{key:?}"));
+            let (lock, ready) = &*self.down_entered;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+            let (lock, ready) = &*self.down_returned;
+            let mut returned = lock.lock().unwrap();
+            while !*returned {
+                returned = ready.wait(returned).unwrap();
+            }
+            match self.outcome {
+                StopRaceOutcome::KeyDownFailure => Err(InputFailure::new("key-down rejected")),
+                StopRaceOutcome::CleanupSuccess | StopRaceOutcome::CleanupFailure => Ok(()),
+            }
+        }
+
+        fn key_up(&mut self, key: LogicalKey) -> Result<(), InputFailure> {
+            self.events.lock().unwrap().push(format!("up:{key:?}"));
+            match self.outcome {
+                StopRaceOutcome::CleanupFailure => Err(InputFailure::new("cleanup rejected")),
+                StopRaceOutcome::KeyDownFailure | StopRaceOutcome::CleanupSuccess => Ok(()),
+            }
+        }
+    }
+
+    struct PanicAfterKeyDownClock {
+        waits: Mutex<usize>,
+    }
+
+    impl PanicAfterKeyDownClock {
+        fn new() -> Self {
+            Self {
+                waits: Mutex::new(0),
+            }
+        }
+    }
+
+    impl Clock for PanicAfterKeyDownClock {
+        fn elapsed(&self) -> Duration {
+            Duration::ZERO
+        }
+
+        fn wait_until(&self, _target: Duration, _receiver: &Receiver<Control>) -> bool {
+            let mut waits = self.waits.lock().unwrap();
+            *waits += 1;
+            if *waits == 2 {
+                panic!("hold-wait panic");
+            }
+            false
+        }
+    }
+
+    #[test]
+    fn stop_racing_with_key_down_failure_returns_idle_with_visible_error() {
+        let (controller, events, down_entered, down_returned) =
+            stop_race(StopRaceOutcome::KeyDownFailure);
+        controller.start(test_request(Mode::Timer)).unwrap();
+        wait_until_true(&down_entered);
+
+        assert!(controller.stop());
+        signal(&down_returned);
+        let snapshot = controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(snapshot.status, RunStatus::Idle);
+        assert_eq!(snapshot.stop_reason, Some(StopReason::InputFailure));
+        assert_eq!(
+            snapshot.error,
+            Some(RunError {
+                code: "input-failure".to_owned(),
+                key: Some(LogicalKey::KeyA),
+                message: "key-down rejected".to_owned(),
+            })
+        );
+        assert_eq!(*events.lock().unwrap(), vec!["down:KeyA"]);
+    }
+
+    #[test]
+    fn stop_racing_with_non_cleanup_panic_returns_idle_with_visible_error() {
+        let (controller, events, down_entered, down_returned) = stop_race_with_clock(
+            StopRaceOutcome::CleanupSuccess,
+            Arc::new(PanicAfterKeyDownClock::new()),
+        );
+        controller.start(test_request(Mode::Timer)).unwrap();
+        wait_until_true(&down_entered);
+
+        assert!(controller.stop());
+        signal(&down_returned);
+        let snapshot = controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(snapshot.status, RunStatus::Idle);
+        assert_eq!(snapshot.stop_reason, Some(StopReason::WorkerPanic));
+        assert_eq!(snapshot.error.as_ref().unwrap().code, "worker-panic");
+        assert_eq!(snapshot.error.as_ref().unwrap().key, Some(LogicalKey::KeyA));
+        assert_eq!(*events.lock().unwrap(), vec!["down:KeyA", "up:KeyA"]);
+    }
+
+    #[test]
+    fn stop_racing_with_cleanup_failure_remains_failed() {
+        let (controller, events, down_entered, down_returned) =
+            stop_race(StopRaceOutcome::CleanupFailure);
+        controller.start(test_request(Mode::Timer)).unwrap();
+        wait_until_true(&down_entered);
+
+        assert!(controller.stop());
+        signal(&down_returned);
+        let snapshot = controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(snapshot.status, RunStatus::Failed);
+        assert_eq!(snapshot.stop_reason, Some(StopReason::InputFailure));
+        assert_eq!(
+            snapshot.error,
+            Some(RunError {
+                code: "input-failure".to_owned(),
+                key: Some(LogicalKey::KeyA),
+                message: "cleanup rejected".to_owned(),
+            })
+        );
+        assert_eq!(*events.lock().unwrap(), vec!["down:KeyA", "up:KeyA"]);
+    }
+
+    type StopRace = (
+        RunController,
+        Arc<Mutex<Vec<String>>>,
+        Arc<(Mutex<bool>, Condvar)>,
+        Arc<(Mutex<bool>, Condvar)>,
+    );
+
+    fn stop_race(outcome: StopRaceOutcome) -> StopRace {
+        stop_race_with_clock(outcome, Arc::new(VirtualClock::new()))
+    }
+
+    fn stop_race_with_clock<C>(outcome: StopRaceOutcome, clock: Arc<C>) -> StopRace
+    where
+        C: Clock + 'static,
+    {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let down_entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let down_returned = Arc::new((Mutex::new(false), Condvar::new()));
+        let controller = RunController::for_test_with_clock(
+            Box::new(StopRaceSink {
+                outcome,
+                events: Arc::clone(&events),
+                down_entered: Arc::clone(&down_entered),
+                down_returned: Arc::clone(&down_returned),
+            }),
+            clock,
+        );
+        (controller, events, down_entered, down_returned)
     }
 
     struct FailingSink {
