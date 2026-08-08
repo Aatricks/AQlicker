@@ -47,12 +47,9 @@ pub fn run() {
             let registry = shortcuts::TauriShortcutRegistry::new(
                 app_handle.clone(),
                 Arc::new(move |action| {
-                    let app = shortcut_app.clone();
-                    std::thread::spawn(move || {
-                        if let Some(service) = app.try_state::<AppService>() {
-                            let _ = service.handle_shortcut(action);
-                        }
-                    });
+                    if let Some(service) = shortcut_app.try_state::<AppService>() {
+                        let _ = service.enqueue_shortcut(action);
+                    }
                 }),
             );
             let service = AppService::new(
