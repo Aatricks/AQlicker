@@ -2201,7 +2201,9 @@ mod tests {
         assert!(
             observed
                 .iter()
-                .any(|&(presses, elapsed_ms)| presses == 1 && (0..5_000).contains(&elapsed_ms)),
+                // Well past the first press's hold, well before the second
+                // press: only the wait itself can publish here.
+                .any(|&(presses, elapsed_ms)| presses == 1 && (1_000..5_000).contains(&elapsed_ms)),
             "the clock must be published while the cooldown is waited out: {observed:?}"
         );
     }
