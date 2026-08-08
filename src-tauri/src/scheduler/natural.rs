@@ -94,9 +94,15 @@ pub struct NaturalSchedule {
     /// selected again. A zero cooldown leaves this at or behind the current
     /// instant forever, so the schedule behaves exactly as it did before.
     available_at_ms: Vec<u64>,
-    /// Time the run spent paused for its target application. Schedule offsets
-    /// exclude it, wall-clock cooldowns include it.
+    /// How far the run's real elapsed time has drifted ahead of the schedule's
+    /// own offsets, almost always because the run paused for its target
+    /// application. Schedule offsets exclude it, wall-clock cooldowns include it.
     pause_credit_ms: u64,
+    /// The key handed out by the last `next_press`, and the offset it was
+    /// planned for. Its cooldown is stamped once the worker reports the press
+    /// actually happened, not when it was planned.
+    pending: Option<usize>,
+    last_plan_offset_ms: u64,
     settings: NaturalSettings,
     rng: ChaCha8Rng,
     target_offset_ms: u64,
@@ -159,6 +165,8 @@ impl NaturalSchedule {
             keys: keys.to_vec(),
             available_at_ms: vec![0; keys.len()],
             pause_credit_ms: 0,
+            pending: None,
+            last_plan_offset_ms: 0,
             settings,
             rng: ChaCha8Rng::seed_from_u64(seed),
             target_offset_ms: 0,
@@ -202,11 +210,8 @@ impl NaturalSchedule {
             (0..self.keys.len())
                 .any(|index| self.is_available(index) && self.keys[index].key != *excluded)
         });
-        let wall_now = self.wall_now();
         let candidates: Vec<usize> = (0..self.keys.len())
-            .filter(|&index| {
-                self.available_at_ms[index] <= wall_now && Some(self.keys[index].key) != excluded
-            })
+            .filter(|&index| self.is_available(index) && Some(self.keys[index].key) != excluded)
             .collect();
         let total_weight: u32 = candidates
             .iter()
@@ -226,9 +231,7 @@ impl NaturalSchedule {
             })
             .expect("positive validated weights leave at least one candidate");
         let key = self.keys[index].key;
-        self.available_at_ms[index] = self
-            .wall_now()
-            .saturating_add(u64::from(self.keys[index].cooldown_ms));
+        self.pending = Some(index);
 
         if self.last_key == Some(key) {
             self.repeat_count = self.repeat_count.saturating_add(1);
@@ -310,17 +313,6 @@ impl NaturalSchedule {
 }
 
 impl PressSchedule for NaturalSchedule {
-    /// Credits the pause so a key that finished cooling while the run was held
-    /// is selectable again on resume. The press already planned when the pause
-    /// began keeps the instant it was planned for, so its own cooldown starts
-    /// up to one pause early; that is a single press, and correcting it would
-    /// need a second callback at emission time.
-    fn credit_pause(&mut self, waited: Duration) {
-        self.pause_credit_ms = self
-            .pause_credit_ms
-            .saturating_add(waited.as_millis() as u64);
-    }
-
     fn next_press(&mut self) -> PressPlan {
         let key = self.choose_key();
         let interval_ms = self.next_interval();
@@ -329,8 +321,24 @@ impl PressSchedule for NaturalSchedule {
             .random_range(self.settings.min_hold_ms..=self.settings.max_hold_ms);
         let hold_ms = sampled_hold.min(interval_ms.saturating_sub(MIN_RELEASE_GAP_MS));
         let plan = PressPlan::new(key, self.target_offset_ms, hold_ms);
+        self.last_plan_offset_ms = self.target_offset_ms;
         self.target_offset_ms = self.target_offset_ms.saturating_add(interval_ms);
         plan
+    }
+
+    /// The cooldown runs from the instant the key was really pressed. Whatever
+    /// the run spent between the planned offset and that instant -- a focus
+    /// pause, almost always -- is also how far real time now leads the
+    /// schedule's own offsets, so the same report keeps both in step.
+    fn record_press(&mut self, at: Duration) {
+        let at_ms = at.as_millis() as u64;
+        self.pause_credit_ms = self
+            .pause_credit_ms
+            .max(at_ms.saturating_sub(self.last_plan_offset_ms));
+        if let Some(index) = self.pending.take() {
+            self.available_at_ms[index] =
+                at_ms.saturating_add(u64::from(self.keys[index].cooldown_ms));
+        }
     }
 }
 

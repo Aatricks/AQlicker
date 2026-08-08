@@ -655,6 +655,18 @@ fn execute_schedule(
             }
             return WorkerExit::Idle(StopReason::DurationComplete);
         }
+        // A cooldown can hold the worker for up to a minute. Republish the run
+        // clock across the wait, the way the pause gate does, so elapsed and
+        // remaining time keep moving instead of freezing between presses.
+        while plan.target_offset.saturating_sub(clock.elapsed()) > PAUSE_POLL_INTERVAL {
+            if clock.wait_until(
+                clock.elapsed().saturating_add(PAUSE_POLL_INTERVAL),
+                receiver,
+            ) {
+                return WorkerExit::Idle(StopReason::Requested);
+            }
+            publish_progress(shared, clock, None);
+        }
         if clock.wait_until(plan.target_offset, receiver) {
             return WorkerExit::Idle(StopReason::Requested);
         }
@@ -673,10 +685,7 @@ fn execute_schedule(
                 Pause::DeadlineReached => {
                     return WorkerExit::Idle(StopReason::DurationComplete);
                 }
-                Pause::Ready(waited) => {
-                    paused_for = paused_for.saturating_add(waited);
-                    schedule.credit_pause(waited);
-                }
+                Pause::Ready(waited) => paused_for = paused_for.saturating_add(waited),
             }
         }
 
@@ -684,6 +693,7 @@ fn execute_schedule(
             return input_failure(plan.key, failure, FailurePhase::Runtime);
         }
         press_state.down_key = Some(plan.key);
+        schedule.record_press(clock.elapsed());
         if clock.wait_until(plan.target_offset.saturating_add(plan.hold_for), receiver) {
             return WorkerExit::Idle(StopReason::Requested);
         }
@@ -730,13 +740,13 @@ fn await_target(
     loop {
         if lock(focus).frontmost().as_deref() == Some(target.id.as_str()) {
             if published {
-                publish_pause(shared, clock, None);
+                publish_progress(shared, clock, None);
             }
             return Pause::Ready(clock.elapsed().saturating_sub(entered));
         }
         if !published {
             published = true;
-            publish_pause(shared, clock, Some(target.name.clone()));
+            publish_progress(shared, clock, Some(target.name.clone()));
         }
         if deadline.is_some_and(|deadline| clock.elapsed() >= deadline) {
             return Pause::DeadlineReached;
@@ -750,8 +760,9 @@ fn await_target(
     }
 }
 
-/// Publishes only the pause transitions, never every poll tick.
-fn publish_pause(shared: &Arc<SharedState>, clock: &dyn Clock, waiting_for_app: Option<String>) {
+/// Publishes the run clock, and with it any pause transition. The pause gate
+/// calls it only on a transition, never on every poll tick.
+fn publish_progress(shared: &Arc<SharedState>, clock: &dyn Clock, waiting_for_app: Option<String>) {
     let mut state = lock(&shared.state);
     state.snapshot.paused = waiting_for_app.is_some();
     state.snapshot.waiting_for_app = waiting_for_app;
@@ -2119,6 +2130,82 @@ mod tests {
         }
     }
 
+    /// The cooldown starts when the key is actually pressed. A pause that lands
+    /// between planning a press and emitting it must not let the next press of
+    /// the same key arrive early.
+    #[test]
+    fn a_pause_between_planning_and_pressing_never_shortens_a_cooldown() {
+        let clock = Arc::new(VirtualClock::new());
+        let press_targets = Arc::new(Mutex::new(Vec::new()));
+        let mut script = vec![Some("com.apple.Safari"); 30];
+        script.push(Some("com.apple.TextEdit"));
+        let controller = controller_with_focus(
+            Box::new(TimedSink {
+                clock: Arc::clone(&clock),
+                press_targets: Arc::clone(&press_targets),
+            }),
+            clock,
+            FakeFocus::new(&script),
+        );
+
+        // 30 polls x 200 ms = 6 s paused before the first press is emitted.
+        controller
+            .start(AppConfig {
+                target_app: Some(TargetApp {
+                    id: "com.apple.TextEdit".to_owned(),
+                    name: "TextEdit".to_owned(),
+                }),
+                ..cooling_request(5_000, 15)
+            })
+            .unwrap();
+        controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        let press_targets = press_targets.lock().unwrap();
+        assert!(
+            press_targets.len() >= 2,
+            "the run must emit more than one press: {press_targets:?}"
+        );
+        for window in press_targets.windows(2) {
+            assert!(
+                window[1] - window[0] >= Duration::from_millis(5_000),
+                "presses landed closer than the cooldown: {press_targets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_waiting_out_a_cooldown_keeps_publishing_its_clock() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = RunController::for_test_with_clock(
+            Box::new(TimedRecordingSink {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(VirtualClock::new()),
+        );
+        let captured = Arc::clone(&observed);
+        controller.set_observer(Arc::new(move |snapshot| {
+            captured
+                .lock()
+                .unwrap()
+                .push((snapshot.successful_presses, snapshot.elapsed_ms));
+        }));
+
+        controller.start(cooling_request(5_000, 6)).unwrap();
+        controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert!(
+            observed
+                .iter()
+                .any(|&(presses, elapsed_ms)| presses == 1 && (0..5_000).contains(&elapsed_ms)),
+            "the clock must be published while the cooldown is waited out: {observed:?}"
+        );
+    }
+
     #[test]
     fn a_cooldown_longer_than_the_run_ends_on_the_deadline_with_no_key_held() {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -2141,35 +2228,50 @@ mod tests {
         assert_eq!(snapshot.error, None);
     }
 
-    /// Cooldowns are wall-clock: a key that finished cooling while the run was
-    /// paused for its target application is selectable again on resume.
+    /// Cooldowns are wall-clock: time the run spends paused for its target
+    /// application after a press counts toward that key's cooldown.
     #[test]
     fn a_key_that_cooled_through_a_focus_pause_is_available_on_resume() {
-        let mut script = vec![Some("com.apple.Safari"); 10];
+        let clock = Arc::new(VirtualClock::new());
+        let press_targets = Arc::new(Mutex::new(Vec::new()));
+        let mut script = vec![Some("com.apple.TextEdit")];
+        script.extend([Some("com.apple.Safari"); 10]);
         script.push(Some("com.apple.TextEdit"));
         let controller = controller_with_focus(
-            Box::new(TimedRecordingSink {
-                events: Arc::new(Mutex::new(Vec::new())),
+            Box::new(TimedSink {
+                clock: Arc::clone(&clock),
+                press_targets: Arc::clone(&press_targets),
             }),
-            Arc::new(VirtualClock::new()),
+            clock,
             FakeFocus::new(&script),
         );
 
-        // 10 polls x 200 ms = 2 s paused, twice the 1 s cooldown.
+        // First press at 0. The second is due at 1 s on its cooldown, then the
+        // run pauses for 10 polls x 200 ms and emits it at 3 s. The 1 s cooldown
+        // is spent by 4 s, so the third press waits only the cooldown, not a
+        // fresh one measured from the resume.
         controller
             .start(AppConfig {
                 target_app: Some(TargetApp {
                     id: "com.apple.TextEdit".to_owned(),
                     name: "TextEdit".to_owned(),
                 }),
-                ..cooling_request(1_000, 3)
+                ..cooling_request(1_000, 5)
             })
             .unwrap();
         let snapshot = controller
             .wait_for_terminal(Duration::from_secs(1))
             .unwrap();
 
-        assert_eq!(snapshot.successful_presses, 2);
+        assert_eq!(
+            *press_targets.lock().unwrap(),
+            vec![
+                Duration::ZERO,
+                Duration::from_secs(3),
+                Duration::from_secs(4)
+            ]
+        );
+        assert_eq!(snapshot.successful_presses, 3);
         assert_eq!(snapshot.stop_reason, Some(StopReason::DurationComplete));
     }
 

@@ -28,9 +28,10 @@ impl PressPlan {
 pub trait PressSchedule: Send {
     fn next_press(&mut self) -> PressPlan;
 
-    /// Reports time the run spent paused for its target application. Schedules
-    /// with a wall-clock constraint credit it; the timer schedule has none.
-    fn credit_pause(&mut self, _waited: Duration) {}
+    /// Reports that the press just planned was emitted, `at` this many
+    /// milliseconds into the run. Schedules with a wall-clock constraint start
+    /// it here; the timer schedule has none.
+    fn record_press(&mut self, _at: Duration) {}
 }
 
 pub fn is_before_deadline(plan: &PressPlan, deadline: Option<Duration>) -> bool {
@@ -99,7 +100,7 @@ mod tests {
         let mut schedule = NaturalSchedule::seeded(&keys, NaturalSettings::from_slider(50), 0x601D);
         let plans: Vec<(LogicalKey, u64, u64)> = (0..20)
             .map(|_| {
-                let plan = schedule.next_press();
+                let plan = press(&mut schedule);
                 (
                     plan.key,
                     plan.target_offset.as_millis() as u64,
@@ -135,6 +136,14 @@ mod tests {
         );
     }
 
+    /// Drives the schedule the way the worker does: plan a press, then report
+    /// that it was emitted at the instant it was planned for.
+    fn press(schedule: &mut NaturalSchedule) -> PressPlan {
+        let plan = schedule.next_press();
+        schedule.record_press(plan.target_offset);
+        plan
+    }
+
     fn cooling_entries(entries: &[(LogicalKey, u8, u32)]) -> Vec<KeyEntry> {
         entries
             .iter()
@@ -164,7 +173,7 @@ mod tests {
     fn a_cooling_single_key_paces_presses_to_its_cooldown() {
         let keys = cooling_entries(&[(LogicalKey::KeyA, 1, 1_000)]);
         let mut schedule = NaturalSchedule::seeded(&keys, NaturalSettings::from_slider(50), 5);
-        let plans: Vec<_> = (0..50).map(|_| schedule.next_press()).collect();
+        let plans: Vec<_> = (0..50).map(|_| press(&mut schedule)).collect();
 
         for window in plans.windows(2) {
             let gap = window[1].target_offset - window[0].target_offset;
@@ -188,7 +197,7 @@ mod tests {
         let mut schedule = NaturalSchedule::seeded(&keys, fixed_interval_settings(), 3);
         let plans: Vec<_> = (0..9)
             .map(|_| {
-                let plan = schedule.next_press();
+                let plan = press(&mut schedule);
                 (plan.key, plan.target_offset.as_millis() as u64)
             })
             .collect();
@@ -225,7 +234,7 @@ mod tests {
         let mut schedule = NaturalSchedule::seeded(&keys, NaturalSettings::from_slider(50), 0xC001);
         let mut counts = [0_u64; 3];
         for _ in 0..100_000 {
-            let index = match schedule.next_press().key {
+            let index = match press(&mut schedule).key {
                 LogicalKey::KeyA => 0,
                 LogicalKey::KeyB => 1,
                 LogicalKey::KeyC => 2,
@@ -451,7 +460,7 @@ mod tests {
             NaturalSchedule::seeded(&keys, NaturalSettings::from_slider(50), 0xA11CE);
         let mut counts = [0_u64; 3];
         for _ in 0..100_000 {
-            let index = match schedule.next_press().key {
+            let index = match press(&mut schedule).key {
                 LogicalKey::KeyA => 0,
                 LogicalKey::KeyB => 1,
                 LogicalKey::KeyC => 2,
