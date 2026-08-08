@@ -12,6 +12,11 @@ import {
 
 type ConfigUpdater = AppConfig | ((current: AppConfig) => AppConfig);
 
+type QueuedSave = {
+  config: AppConfig;
+  serialized: string;
+};
+
 function errorMessage(error: unknown) {
   if (error instanceof Error) return error.message;
   if (typeof error === "object" && error && "code" in error) {
@@ -28,14 +33,15 @@ export function useConfig(api: AqlickerApi = aqlickerApi) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const persistedConfig = useRef<string | null>(null);
+  const queuedSave = useRef<QueuedSave | null>(null);
+  const saveInFlight = useRef(false);
   const mounted = useRef(false);
-  const saveGeneration = useRef(0);
 
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
-      saveGeneration.current += 1;
+      queuedSave.current = null;
     };
   }, []);
 
@@ -71,32 +77,62 @@ export function useConfig(api: AqlickerApi = aqlickerApi) {
     [config],
   );
 
+  const drainSaves = useCallback(
+    function drainSaves() {
+      if (!mounted.current || saveInFlight.current) return;
+
+      const candidate = queuedSave.current;
+      if (!candidate) return;
+      queuedSave.current = null;
+
+      if (candidate.serialized === persistedConfig.current) {
+        setSaveError(null);
+        return;
+      }
+
+      saveInFlight.current = true;
+      void api
+        .saveConfig(candidate.config)
+        .then(
+          () => {
+            if (!mounted.current) return;
+            persistedConfig.current = candidate.serialized;
+            setSaveError(null);
+          },
+          (error: unknown) => {
+            if (!mounted.current) return;
+            if (!queuedSave.current) {
+              setSaveError(errorMessage(error));
+            }
+          },
+        )
+        .finally(() => {
+          saveInFlight.current = false;
+          if (mounted.current) drainSaves();
+        });
+    },
+    [api],
+  );
+
   useEffect(() => {
-    const generation = ++saveGeneration.current;
     if (!config || Object.keys(errors).length > 0) return;
 
     const serialized = JSON.stringify(config);
-    if (serialized === persistedConfig.current) return;
+    if (
+      !saveInFlight.current &&
+      !queuedSave.current &&
+      serialized === persistedConfig.current
+    ) {
+      return;
+    }
 
     const timeout = window.setTimeout(() => {
-      void api
-        .saveConfig(config)
-        .then(() => {
-          if (!mounted.current || generation !== saveGeneration.current) {
-            return;
-          }
-          persistedConfig.current = serialized;
-          setSaveError(null);
-        })
-        .catch((error: unknown) => {
-          if (mounted.current && generation === saveGeneration.current) {
-            setSaveError(errorMessage(error));
-          }
-        });
+      queuedSave.current = { config, serialized };
+      drainSaves();
     }, 250);
 
     return () => window.clearTimeout(timeout);
-  }, [api, config, errors]);
+  }, [config, drainSaves, errors]);
 
   const updateConfig = useCallback((updater: ConfigUpdater) => {
     setConfig((current) => {

@@ -69,10 +69,19 @@ describe("useConfig", () => {
     await act(async () => vi.advanceTimersByTimeAsync(249));
     expect(api.saveConfig).not.toHaveBeenCalled();
 
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        timer: { intervalMs: 150 },
+      }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(249));
+    expect(api.saveConfig).not.toHaveBeenCalled();
+
     await act(async () => vi.advanceTimersByTimeAsync(1));
     expect(api.saveConfig).toHaveBeenCalledTimes(1);
     expect(api.saveConfig).toHaveBeenLastCalledWith(
-      expect.objectContaining({ timer: { intervalMs: 125 } }),
+      expect.objectContaining({ timer: { intervalMs: 150 } }),
     );
 
     act(() => {
@@ -158,13 +167,19 @@ describe("useConfig", () => {
     );
   });
 
-  it("does not let an older save success replace the newer persisted marker", async () => {
-    const api = fakeApi();
-    const older = deferred<void>();
-    const newer = deferred<void>();
+  it("compensates when an in-flight save settles after the draft returns to the loaded config", async () => {
+    const payload = bootstrap();
+    const firstSave = deferred<void>();
+    let durableConfig = payload.config;
+    const api = fakeApi(payload);
     vi.mocked(api.saveConfig)
-      .mockReturnValueOnce(older.promise)
-      .mockReturnValueOnce(newer.promise);
+      .mockImplementationOnce(async (candidate) => {
+        await firstSave.promise;
+        durableConfig = candidate;
+      })
+      .mockImplementation(async (candidate) => {
+        durableConfig = candidate;
+      });
     const { result } = renderHook(() => useConfig(api));
     await waitFor(() => expect(result.current.config).not.toBeNull());
     vi.useFakeTimers();
@@ -176,38 +191,94 @@ describe("useConfig", () => {
       }));
     });
     await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(api.saveConfig).toHaveBeenCalledTimes(1);
+
     act(() => {
       result.current.updateConfig((current) => ({
         ...current,
-        timer: { intervalMs: 150 },
+        timer: { intervalMs: 39 },
       }));
+    });
+    act(() => {
+      result.current.updateConfig(payload.config);
     });
     await act(async () => vi.advanceTimersByTimeAsync(250));
 
     await act(async () => {
-      newer.resolve();
-      await newer.promise;
-      older.resolve();
-      await older.promise;
+      firstSave.resolve();
+      await firstSave.promise;
     });
 
-    act(() => {
-      result.current.updateConfig((current) => ({
-        ...current,
-        timer: { intervalMs: 125 },
-      }));
-    });
-    await act(async () => vi.advanceTimersByTimeAsync(250));
-    expect(api.saveConfig).toHaveBeenCalledTimes(3);
+    expect(api.saveConfig).toHaveBeenCalledTimes(2);
+    expect(api.saveConfig).toHaveBeenLastCalledWith(payload.config);
+    expect(durableConfig).toEqual(payload.config);
   });
 
-  it("ignores an older save failure after a newer save succeeds", async () => {
-    const api = fakeApi();
-    const older = deferred<void>();
-    const newer = deferred<void>();
+  it("coalesces rapid valid drafts behind one in-flight save without overlap", async () => {
+    const payload = bootstrap();
+    const firstSave = deferred<void>();
+    let durableConfig = payload.config;
+    let activeSaves = 0;
+    let maximumActiveSaves = 0;
+    let saveNumber = 0;
+    const api = fakeApi(payload);
+    vi.mocked(api.saveConfig).mockImplementation(async (candidate) => {
+      saveNumber += 1;
+      activeSaves += 1;
+      maximumActiveSaves = Math.max(maximumActiveSaves, activeSaves);
+      try {
+        if (saveNumber === 1) await firstSave.promise;
+        durableConfig = candidate;
+      } finally {
+        activeSaves -= 1;
+      }
+    });
+    const { result } = renderHook(() => useConfig(api));
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+    vi.useFakeTimers();
+
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        timer: { intervalMs: 125 },
+      }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        timer: { intervalMs: 150 },
+      }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(api.saveConfig).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      firstSave.resolve();
+      await firstSave.promise;
+    });
+
+    expect(api.saveConfig).toHaveBeenCalledTimes(2);
+    expect(api.saveConfig).toHaveBeenLastCalledWith(
+      expect.objectContaining({ timer: { intervalMs: 150 } }),
+    );
+    expect(maximumActiveSaves).toBe(1);
+    expect(durableConfig.timer.intervalMs).toBe(150);
+  });
+
+  it("continues with the latest queued draft after an in-flight save fails", async () => {
+    const payload = bootstrap();
+    const firstSave = deferred<void>();
+    let durableConfig = payload.config;
+    const api = fakeApi(payload);
     vi.mocked(api.saveConfig)
-      .mockReturnValueOnce(older.promise)
-      .mockReturnValueOnce(newer.promise);
+      .mockImplementationOnce(async () => {
+        await firstSave.promise;
+      })
+      .mockImplementation(async (candidate) => {
+        durableConfig = candidate;
+      });
     const { result } = renderHook(() => useConfig(api));
     await waitFor(() => expect(result.current.config).not.toBeNull());
     vi.useFakeTimers();
@@ -228,21 +299,27 @@ describe("useConfig", () => {
     await act(async () => vi.advanceTimersByTimeAsync(250));
 
     await act(async () => {
-      newer.resolve();
-      await newer.promise;
-      older.reject(new Error("stale failure"));
-      await older.promise.catch(() => undefined);
+      firstSave.reject(new Error("first save failed"));
+      await firstSave.promise.catch(() => undefined);
     });
+
+    expect(api.saveConfig).toHaveBeenCalledTimes(2);
+    expect(api.saveConfig).toHaveBeenLastCalledWith(
+      expect.objectContaining({ timer: { intervalMs: 150 } }),
+    );
+    expect(durableConfig.timer.intervalMs).toBe(150);
     expect(result.current.saveError).toBeNull();
   });
 
-  it("does not let an older save success clear a newer save failure", async () => {
-    const api = fakeApi();
-    const older = deferred<void>();
-    const newer = deferred<void>();
+  it("surfaces a latest failure and retries that draft when it is submitted again", async () => {
+    const payload = bootstrap();
+    let durableConfig = payload.config;
+    const api = fakeApi(payload);
     vi.mocked(api.saveConfig)
-      .mockReturnValueOnce(older.promise)
-      .mockReturnValueOnce(newer.promise);
+      .mockRejectedValueOnce(new Error("save failed"))
+      .mockImplementation(async (candidate) => {
+        durableConfig = candidate;
+      });
     const { result } = renderHook(() => useConfig(api));
     await waitFor(() => expect(result.current.config).not.toBeNull());
     vi.useFakeTimers();
@@ -254,25 +331,38 @@ describe("useConfig", () => {
       }));
     });
     await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(result.current.saveError).toBe("save failed");
+
     act(() => {
-      result.current.updateConfig((current) => ({
-        ...current,
-        timer: { intervalMs: 150 },
-      }));
+      result.current.updateConfig((current) => ({ ...current }));
     });
     await act(async () => vi.advanceTimersByTimeAsync(250));
 
-    await act(async () => {
-      newer.reject(new Error("newer failure"));
-      await newer.promise.catch(() => undefined);
-    });
-    expect(result.current.saveError).toBe("newer failure");
+    expect(api.saveConfig).toHaveBeenCalledTimes(2);
+    expect(durableConfig.timer.intervalMs).toBe(125);
+    expect(result.current.saveError).toBeNull();
+  });
 
-    await act(async () => {
-      older.resolve();
-      await older.promise;
+  it("does not save again when the latest draft is already settled", async () => {
+    const api = fakeApi();
+    const { result } = renderHook(() => useConfig(api));
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+    vi.useFakeTimers();
+
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        timer: { intervalMs: 125 },
+      }));
     });
-    expect(result.current.saveError).toBe("newer failure");
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(api.saveConfig).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      result.current.updateConfig((current) => ({ ...current }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    expect(api.saveConfig).toHaveBeenCalledTimes(1);
   });
 
   it("ignores an in-flight save callback after unmount", async () => {
@@ -290,11 +380,21 @@ describe("useConfig", () => {
       }));
     });
     await act(async () => vi.advanceTimersByTimeAsync(250));
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        timer: { intervalMs: 150 },
+      }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(api.saveConfig).toHaveBeenCalledTimes(1);
+
     const lastVisibleError = result.current.saveError;
     unmount();
 
     saving.reject(new Error("after unmount"));
     await saving.promise.catch(() => undefined);
     expect(result.current.saveError).toBe(lastVisibleError);
+    expect(api.saveConfig).toHaveBeenCalledTimes(1);
   });
 });
