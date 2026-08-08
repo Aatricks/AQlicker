@@ -28,7 +28,10 @@ export function PermissionBanner({
 
   if (status.sameIntegrityOnly) {
     return (
-      <section className="permission-banner permission-note">
+      <section
+        aria-label="Input target limits"
+        className="permission-banner permission-note"
+      >
         <p>
           AQlicker can only send keys to applications running at the same or a
           lower privilege level.

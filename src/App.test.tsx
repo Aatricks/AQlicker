@@ -147,8 +147,24 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
   });
 
+  it("adopts a run already in progress from the bootstrap snapshot", async () => {
+    const { api } = fakeApi({
+      config: naturalConfig(),
+      run: runningState({ elapsedMs: 12_000, successfulPresses: 48 }),
+    });
+    render(<App api={api} />);
+
+    expect(await screen.findByText("Running · Natural")).toBeVisible();
+    expect(screen.getByText("48 presses")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Add key" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
+    expect(api.startRun).not.toHaveBeenCalled();
+  });
+
   it("locks and unlocks from backend events without ever resuming a run", async () => {
     const { api, emit } = fakeApi({ config: naturalConfig() });
+    // The reply is still in flight while presses keep being published.
+    vi.mocked(api.stopRun).mockImplementation(() => new Promise(() => undefined));
     render(<App api={api} />);
     await screen.findByRole("button", { name: "Add key" });
 
@@ -347,7 +363,39 @@ describe("App", () => {
       status: "failed",
       error: { code: "wait-timeout", key: null, message: "shutdown timed out" },
     });
-    expect(screen.getByText("shutdown timed out")).toBeVisible();
+    expect(
+      screen.getByText("AQlicker timed out waiting for the run to finish."),
+    ).toBeVisible();
+  });
+
+  it("never shows a raw backend identifier for a coded rejection", async () => {
+    const { api } = fakeApi({ config: naturalConfig() });
+    vi.mocked(api.startRun).mockRejectedValueOnce({
+      code: "run-terminal-pending",
+    });
+    render(<App api={api} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+
+    expect(
+      await screen.findByText(
+        "The previous run is still finishing. Try again in a moment.",
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText("run-terminal-pending")).not.toBeInTheDocument();
+  });
+
+  it("falls back to generic wording instead of echoing an unmapped code", async () => {
+    const { api } = fakeApi({ config: naturalConfig() });
+    vi.mocked(api.startRun).mockRejectedValueOnce({ code: "brand-new-code" });
+    render(<App api={api} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+
+    expect(
+      await screen.findByText("AQlicker could not complete that action."),
+    ).toBeVisible();
+    expect(screen.queryByText("brand-new-code")).not.toBeInTheDocument();
   });
 
   it("explains a rejected Start using the backend error code", async () => {

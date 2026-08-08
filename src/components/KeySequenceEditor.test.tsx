@@ -206,4 +206,34 @@ describe("KeySequenceEditor", () => {
     ).toHaveAttribute("aria-invalid", "true");
     expect(screen.getByText("Choose a weight from 1 to 10")).toBeVisible();
   });
+
+  it("closes the picker and refuses selection when a run locks the editor", () => {
+    const onChange = vi.fn();
+    const { rerender } = render(
+      <KeySequenceEditor
+        value={[entry("KeyA")]}
+        onChange={onChange}
+        mode="timer"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Add key" }));
+    const capture = screen.getByRole("button", { name: "Physical key capture" });
+    fireEvent.click(capture);
+
+    // A global toggle can start a run while the dialog is open; the dialog can
+    // never intercept that OS-level shortcut.
+    rerender(
+      <KeySequenceEditor
+        value={[entry("KeyA")]}
+        onChange={onChange}
+        mode="timer"
+        disabled
+      />,
+    );
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    fireEvent.keyDown(capture, { code: "Space", key: " " });
+    expect(onChange).not.toHaveBeenCalled();
+  });
 });

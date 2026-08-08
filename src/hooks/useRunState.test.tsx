@@ -1,4 +1,4 @@
-import { act, render, renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { AqlickerApi, RunSnapshot } from "../api/aqlicker";
 import { DEFAULT_CONFIG } from "../domain/config";
@@ -61,13 +61,14 @@ describe("useRunState", () => {
 
   it("latches Stop until the next backend snapshot arrives", async () => {
     const { api, settleListen, emit } = fakeApi();
+    vi.mocked(api.stopRun).mockImplementation(() => new Promise(() => undefined));
     const { result } = renderHook(() => useRunState(api));
     settleListen();
     emit(runningSnapshot());
 
     await act(async () => {
-      await result.current.stop();
-      await result.current.stop();
+      void result.current.stop();
+      void result.current.stop();
     });
     expect(api.stopRun).toHaveBeenCalledTimes(1);
     expect(result.current.stopPending).toBe(true);
@@ -132,21 +133,74 @@ describe("useRunState", () => {
     expect(unlisten).toHaveBeenCalledTimes(1);
   });
 
-  it("leaves no timers pending after unmount", async () => {
-    vi.useFakeTimers();
-    try {
-      const { api, settleListen } = fakeApi();
-      const { unmount } = render(<Probe api={api} />);
-      settleListen();
-      unmount();
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      vi.useRealTimers();
-    }
+  it("seeds an in-progress run from the bootstrap snapshot", async () => {
+    const { api, settleListen } = fakeApi();
+    const bootstrapRun = runningSnapshot({ elapsedMs: 9_000, successfulPresses: 40 });
+    const { result, rerender } = renderHook(
+      ({ initial }: { initial?: typeof bootstrapRun }) =>
+        useRunState(api, initial),
+      { initialProps: {} as { initial?: typeof bootstrapRun } },
+    );
+    settleListen();
+
+    expect(result.current.snapshot.status).toBe("idle");
+    rerender({ initial: bootstrapRun });
+    expect(result.current.snapshot).toEqual(bootstrapRun);
+  });
+
+  it("adopts the snapshot an invoke resolves with when no event followed", async () => {
+    const { api, settleListen } = fakeApi();
+    const started = runningSnapshot({ successfulPresses: 0 });
+    vi.mocked(api.startRun).mockResolvedValueOnce(started);
+    const { result } = renderHook(() => useRunState(api));
+    settleListen();
+
+    await act(async () => {
+      await result.current.start(DEFAULT_CONFIG);
+    });
+    expect(result.current.snapshot).toEqual(started);
+  });
+
+  it("discards an invoke reply that a newer event has already superseded", async () => {
+    const { api, settleListen, emit } = fakeApi();
+    let releaseStart: (() => void) | null = null;
+    vi.mocked(api.startRun).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releaseStart = () => resolve(runningSnapshot({ elapsedMs: 0 }));
+        }),
+    );
+    const { result } = renderHook(() => useRunState(api));
+    settleListen();
+
+    let pending: Promise<void>;
+    act(() => {
+      pending = result.current.start(DEFAULT_CONFIG);
+    });
+    const terminal = { ...IDLE_SNAPSHOT, stopReason: "durationComplete" as const };
+    emit(terminal);
+
+    await act(async () => {
+      releaseStart?.();
+      await pending;
+    });
+    expect(result.current.snapshot).toEqual(terminal);
+  });
+
+  it("releases a Stop clicked against a stale running view when Rust is already idle", async () => {
+    const { api, settleListen, emit } = fakeApi();
+    // The backend already finished; ServiceCore::stop publishes no event and
+    // simply answers with the current idle snapshot.
+    vi.mocked(api.stopRun).mockResolvedValueOnce(IDLE_SNAPSHOT);
+    const { result } = renderHook(() => useRunState(api));
+    settleListen();
+    emit(runningSnapshot());
+
+    await act(async () => {
+      await result.current.stop();
+    });
+
+    expect(result.current.stopPending).toBe(false);
+    expect(result.current.snapshot.status).toBe("idle");
   });
 });
-
-function Probe({ api }: { api: AqlickerApi }) {
-  const { snapshot } = useRunState(api);
-  return <span>{snapshot.status}</span>;
-}

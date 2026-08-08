@@ -59,10 +59,10 @@ describe("PermissionBanner", () => {
     );
 
     expect(
-      screen.getByText(
-        "AQlicker can only send keys to applications running at the same or a lower privilege level.",
-      ),
-    ).toBeVisible();
+      screen.getByRole("region", { name: "Input target limits" }),
+    ).toHaveTextContent(
+      "AQlicker can only send keys to applications running at the same or a lower privilege level.",
+    );
     expect(
       screen.queryByRole("button", { name: "Request access" }),
     ).not.toBeInTheDocument();

@@ -20,9 +20,18 @@ describe("RunControls", () => {
       />,
     );
 
-    expect(screen.getByRole("button", { name: "Start" })).toBeDisabled();
+    const start = screen.getByRole("button", { name: "Start" });
+    expect(start).toBeDisabled();
     expect(screen.getByText("Choose at least one key")).toBeVisible();
     expect(screen.getByText("Grant input permission")).toBeVisible();
+
+    // Disabled buttons leave the tab order, so the reasons must be announced
+    // through the button's own description.
+    const describedBy = start.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(describedBy!)).toHaveTextContent(
+      "Grant input permission",
+    );
   });
 
   it("starts only when every prerequisite passes", () => {

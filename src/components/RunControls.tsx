@@ -56,7 +56,7 @@ export function RunControls({
             </span>
           </span>
         ) : blockers.length > 0 ? (
-          <ul className="run-blockers">
+          <ul className="run-blockers" id="run-blockers">
             {blockers.map((blocker) => (
               <li key={blocker}>{blocker}</li>
             ))}
@@ -77,6 +77,7 @@ export function RunControls({
         </button>
       ) : (
         <button
+          aria-describedby={blockers.length > 0 ? "run-blockers" : undefined}
           className="start-button"
           disabled={blockers.length > 0}
           onClick={onStart}

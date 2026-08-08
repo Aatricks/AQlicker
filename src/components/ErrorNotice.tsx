@@ -32,7 +32,23 @@ const MESSAGES: Record<string, string> = {
   "run-busy": "A run is already active.",
   "service-unavailable": "AQlicker is not responding. Restart the application.",
   "service-shutting-down": "AQlicker is shutting down.",
+  "run-terminal-pending":
+    "The previous run is still finishing. Try again in a moment.",
+  "input-unavailable":
+    "AQlicker could not open a connection for sending keys on this system.",
+  "shortcut-rollback-failed":
+    "The global shortcut could not be restored. Record it again.",
+  "worker-spawn-failed": "AQlicker could not start the run. Try again.",
+  "wait-timeout": "AQlicker timed out waiting for the run to finish.",
+  "config-save-failed": "AQlicker could not save the configuration.",
+  "shortcut-invalid": "That shortcut is not a combination AQlicker can register.",
+  "shortcut-reserved": "That shortcut is reserved. Record a different one.",
+  "unsupported-schema":
+    "The saved settings come from a newer version of AQlicker.",
+  "start-failed": "AQlicker could not start the run.",
 };
+
+const GENERIC = "AQlicker could not complete that action.";
 
 const ELEVATED_HINT =
   " The focused application may be running at a higher privilege level; both applications must run at compatible levels.";
@@ -50,7 +66,9 @@ function describe({
       sameIntegrityOnly ? ELEVATED_HINT : ""
     }`;
   }
-  return MESSAGES[code] ?? detail ?? code;
+  // Coded rejections carry no message, so an unmapped code must not leak the
+  // raw backend identifier into the interface.
+  return MESSAGES[code] ?? (detail ? detail : GENERIC);
 }
 
 export function ErrorNotice(props: ErrorNoticeProps) {

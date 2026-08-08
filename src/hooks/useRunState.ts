@@ -30,15 +30,35 @@ function toRunError(error: unknown): RunError {
 
 /**
  * Mirrors the Rust run controller. Rust owns elapsed and remaining time, so the
- * snapshot is only ever replaced by a backend event — invoke results are used
- * for rejection reporting alone and never overwrite a newer event.
+ * hook never derives them locally. Snapshots reach it from three places, in
+ * descending authority: run-state events, the snapshot an invoke resolves with,
+ * and the bootstrap payload. Tauri does not replay emits and the bootstrap
+ * request races listener registration, so the latter two are needed to notice a
+ * run that was already active — but they are only applied when no event has
+ * arrived since they were requested, so a slow reply cannot undo a newer event.
  */
-export function useRunState(api: AqlickerApi = aqlickerApi) {
+export function useRunState(
+  api: AqlickerApi = aqlickerApi,
+  initial?: RunSnapshot | null,
+) {
   const [snapshot, setSnapshot] = useState<RunSnapshot>(IDLE_SNAPSHOT);
   const [error, setError] = useState<RunError | null>(null);
   const [stopPending, setStopPending] = useState(false);
   const mounted = useRef(true);
   const stopInFlight = useRef(false);
+  const events = useRef(0);
+  const seeded = useRef(false);
+
+  const apply = useCallback((next: RunSnapshot) => {
+    setSnapshot(next);
+    setError(next.error);
+    // Rust also publishes a snapshot after every successful press, so the Stop
+    // latch may only be released once the run has left `running`.
+    if (next.status !== "running") {
+      stopInFlight.current = false;
+      setStopPending(false);
+    }
+  }, []);
 
   useEffect(() => {
     mounted.current = true;
@@ -48,14 +68,8 @@ export function useRunState(api: AqlickerApi = aqlickerApi) {
     void api
       .listenRunState((next) => {
         if (disposed) return;
-        setSnapshot(next);
-        setError(next.error);
-        // Rust also publishes a snapshot after every successful press, so the
-        // Stop latch may only be released once the run has left `running`.
-        if (next.status !== "running") {
-          stopInFlight.current = false;
-          setStopPending(false);
-        }
+        events.current += 1;
+        apply(next);
       })
       .then((dispose) => {
         if (disposed) dispose();
@@ -68,28 +82,45 @@ export function useRunState(api: AqlickerApi = aqlickerApi) {
       mounted.current = false;
       unlisten?.();
     };
-  }, [api]);
+  }, [api, apply]);
+
+  useEffect(() => {
+    if (!initial || seeded.current) return;
+    seeded.current = true;
+    if (events.current === 0) apply(initial);
+  }, [apply, initial]);
+
+  const settle = useCallback(
+    (seen: number, next: RunSnapshot) => {
+      if (mounted.current && events.current === seen) apply(next);
+    },
+    [apply],
+  );
 
   const start = useCallback(
     async (config: AppConfig) => {
       setError(null);
+      const seen = events.current;
       try {
-        await api.startRun(config);
+        settle(seen, await api.startRun(config));
       } catch (rejection) {
         if (mounted.current) setError(toRunError(rejection));
       }
     },
-    [api],
+    [api, settle],
   );
 
-  // Stays latched after the first Stop until Rust publishes the next snapshot,
-  // so a second click cannot reach the backend.
+  // Stays latched after the first Stop until Rust reports a snapshot that has
+  // left `running`, so a second click cannot reach the backend. Applying the
+  // reply matters when the backend was already idle: `RunController::stop`
+  // publishes nothing in that case, so no event would ever release the latch.
   const stop = useCallback(async () => {
     if (stopInFlight.current) return;
     stopInFlight.current = true;
     setStopPending(true);
+    const seen = events.current;
     try {
-      await api.stopRun();
+      settle(seen, await api.stopRun());
     } catch (rejection) {
       stopInFlight.current = false;
       if (mounted.current) {
@@ -97,7 +128,7 @@ export function useRunState(api: AqlickerApi = aqlickerApi) {
         setStopPending(false);
       }
     }
-  }, [api]);
+  }, [api, settle]);
 
   const dismissError = useCallback(() => setError(null), []);
 

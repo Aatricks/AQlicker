@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   aqlickerApi,
   type AqlickerApi,
@@ -35,7 +35,7 @@ function App({ api = aqlickerApi }: AppProps) {
     updateConfig,
     registerShortcut,
   } = useConfig(api);
-  const run = useRunState(api);
+  const run = useRunState(api, bootstrap?.run);
 
   const [permissionOverride, setPermissionOverride] =
     useState<PermissionStatus | null>(null);
@@ -66,13 +66,25 @@ function App({ api = aqlickerApi }: AppProps) {
     };
   }, [api]);
 
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
   const requestAccess = useCallback(() => {
     setRequesting(true);
     void api
       .requestAccess()
-      .then(setPermissionOverride)
+      .then((status) => {
+        if (mounted.current) setPermissionOverride(status);
+      })
       .catch(() => undefined)
-      .finally(() => setRequesting(false));
+      .finally(() => {
+        if (mounted.current) setRequesting(false);
+      });
   }, [api]);
 
   const recordShortcut = useCallback(

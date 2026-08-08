@@ -99,7 +99,15 @@ export function KeySequenceEditor({
     if (pickerOpen) captureRef.current?.focus();
   }, [pickerOpen]);
 
+  // A run can start from the global toggle while the dialog is open, and the
+  // dialog cannot intercept an OS-level shortcut. Close it rather than let it
+  // keep editing a configuration the rest of the interface reports as locked.
+  useEffect(() => {
+    if (disabled) setPickerOpen(false);
+  }, [disabled]);
+
   const selectKey = (key: LogicalKey) => {
+    if (disabled) return;
     const existing = value.find(({ key: selected }) => selected === key);
     if (existing) {
       setPickerOpen(false);
@@ -111,7 +119,7 @@ export function KeySequenceEditor({
   };
 
   const capturePhysicalKey = (event: KeyboardEvent<HTMLButtonElement>) => {
-    if (!captureArmed) return;
+    if (!captureArmed || disabled) return;
     event.preventDefault();
     event.stopPropagation();
     if (event.code === "Escape") {
