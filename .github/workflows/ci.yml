@@ -26,7 +26,9 @@ jobs:
         with:
           components: rustfmt
       - run: pnpm install --frozen-lockfile
-      - run: pnpm test -- --run
+      # Not `pnpm test -- --run`: pnpm passes `--` through literally, so vitest
+      # sees an inert flag and run mode would rely on TTY detection alone.
+      - run: pnpm exec vitest --run
       - run: pnpm build
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
       - run: cargo test --manifest-path src-tauri/Cargo.toml
