@@ -5,4 +5,10 @@ docs/verification/
 node_modules/
 dist/
 src-tauri/target/
+src-tauri/gen/
+target/
+*.app/
+*.dmg
+*.msi
+*.exe
 .DS_Store

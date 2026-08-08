@@ -1,0 +1,18 @@
+[package]
+name = "aqlicker"
+version = "0.1.0"
+description = "A local AQlicker desktop application"
+authors = ["aatricks"]
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+name = "aqlicker_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-global-shortcut = "2"
