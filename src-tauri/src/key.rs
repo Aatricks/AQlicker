@@ -283,3 +283,33 @@ impl LogicalKey {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_and_modifier_keys_are_not_supported_logical_keys() {
+        for unsupported in [
+            "Escape",
+            "Alt",
+            "Control",
+            "Meta",
+            "Shift",
+            "AltLeft",
+            "ControlLeft",
+            "MetaLeft",
+            "ShiftLeft",
+            "AltRight",
+            "ControlRight",
+            "MetaRight",
+            "ShiftRight",
+        ] {
+            let encoded = format!("\"{unsupported}\"");
+            assert!(
+                serde_json::from_str::<LogicalKey>(&encoded).is_err(),
+                "{unsupported} must not become an injectable logical key"
+            );
+        }
+    }
+}
