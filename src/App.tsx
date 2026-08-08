@@ -13,12 +13,18 @@ function App({ api = aqlickerApi }: AppProps) {
   const {
     config,
     errors,
+    startErrors,
     loading,
     loadError,
     saveError,
     updateConfig,
     registerShortcut,
   } = useConfig(api);
+  const bootstrapStatus = loading
+    ? "Loading"
+    : loadError
+      ? "Unavailable"
+      : "Ready";
 
   return (
     <main className="app-background">
@@ -28,9 +34,12 @@ function App({ api = aqlickerApi }: AppProps) {
             <p className="eyebrow">Desktop key repeater</p>
             <h1>AQlicker</h1>
           </div>
-          <p className="status" role="status">
+          <p
+            className={`status${loadError ? " status-error" : ""}`}
+            role="status"
+          >
             <span aria-hidden="true" />
-            {loading ? "Loading" : "Ready"}
+            {bootstrapStatus}
           </p>
         </header>
 
@@ -43,7 +52,7 @@ function App({ api = aqlickerApi }: AppProps) {
         {config && (
           <div className="configuration-stack">
             <KeySequenceEditor
-              error={errors.keys}
+              error={startErrors.keys}
               errors={errors}
               mode={config.mode}
               onChange={(keys) =>
@@ -78,8 +87,10 @@ function App({ api = aqlickerApi }: AppProps) {
 
         <footer className="run-footer">
           <div>
-            <strong>Idle</strong>
-            <span>Configure a run above</span>
+            <strong>{loadError ? "Unavailable" : "Idle"}</strong>
+            <span>
+              {loadError ? "Settings could not be loaded" : "Configure a run above"}
+            </span>
           </div>
           <button className="start-button" type="button" disabled>
             Start

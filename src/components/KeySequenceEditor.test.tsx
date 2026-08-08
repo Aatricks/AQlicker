@@ -19,12 +19,15 @@ describe("KeySequenceEditor", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Add key" }));
-    const dialog = screen.getByRole("dialog");
-    fireEvent.keyDown(dialog, { code: "Numpad1", key: "1" });
+    const capture = screen.getByRole("button", {
+      name: "Physical key capture",
+    });
+    fireEvent.click(capture);
+    fireEvent.keyDown(capture, { code: "Numpad1", key: "1" });
     expect(onChange).not.toHaveBeenCalled();
     expect(screen.getByText(/not supported/i)).toBeVisible();
 
-    fireEvent.keyDown(dialog, { code: "KeyA", key: "a" });
+    fireEvent.keyDown(capture, { code: "KeyA", key: "a" });
     expect(onChange).not.toHaveBeenCalled();
     expect(screen.getByTestId("key-KeyA")).toHaveFocus();
   });
@@ -49,6 +52,81 @@ describe("KeySequenceEditor", () => {
       entry("KeyA"),
       entry("Space"),
     ]);
+    expect(screen.getByRole("button", { name: "Add key" })).toHaveFocus();
+  });
+
+  it("does not capture keyboard navigation or control activation bubbling in the dialog", () => {
+    const onChange = vi.fn();
+    render(
+      <KeySequenceEditor
+        value={[entry("KeyA")]}
+        onChange={onChange}
+        mode="timer"
+      />,
+    );
+
+    const addKey = screen.getByRole("button", { name: "Add key" });
+    fireEvent.click(addKey);
+    const capture = screen.getByRole("button", {
+      name: "Physical key capture",
+    });
+    expect(capture).toHaveFocus();
+    fireEvent.keyDown(capture, { code: "Tab", key: "Tab" });
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog")).toBeVisible();
+
+    const search = screen.getByRole("searchbox", { name: "Search keys" });
+    search.focus();
+    fireEvent.keyDown(search, { code: "Tab", key: "Tab" });
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog")).toBeVisible();
+
+    const close = screen.getByRole("button", { name: "Close key picker" });
+    fireEvent.keyDown(close, { code: "Space", key: " " });
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.click(close);
+    expect(addKey).toHaveFocus();
+
+    fireEvent.click(addKey);
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search keys" }), {
+      target: { value: "KeyB" },
+    });
+    const keyOption = screen.getByRole("button", { name: /B.*KeyB/ });
+    fireEvent.keyDown(keyOption, { code: "Enter", key: "Enter" });
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.click(keyOption);
+    expect(onChange).toHaveBeenCalledWith([entry("KeyA"), entry("KeyB")]);
+    expect(addKey).toHaveFocus();
+  });
+
+  it("contains dialog focus and restores Add key on Escape", () => {
+    render(
+      <KeySequenceEditor
+        value={[entry("KeyA")]}
+        onChange={vi.fn()}
+        mode="timer"
+      />,
+    );
+
+    const addKey = screen.getByRole("button", { name: "Add key" });
+    fireEvent.click(addKey);
+    const dialog = screen.getByRole("dialog");
+    const dialogButtons = within(dialog).getAllByRole("button");
+    const first = dialogButtons[0];
+    const last = dialogButtons.at(-1)!;
+
+    first.focus();
+    fireEvent.keyDown(first, { code: "Tab", key: "Tab", shiftKey: true });
+    expect(last).toHaveFocus();
+
+    fireEvent.keyDown(last, { code: "Tab", key: "Tab" });
+    expect(first).toHaveFocus();
+
+    const search = screen.getByRole("searchbox", { name: "Search keys" });
+    search.focus();
+    fireEvent.keyDown(search, { code: "Escape", key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(addKey).toHaveFocus();
   });
 
   it("removes and reorders keys with buttons and pointer drag", () => {

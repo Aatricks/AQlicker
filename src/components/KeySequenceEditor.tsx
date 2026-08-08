@@ -1,4 +1,11 @@
-import { useMemo, useRef, useState, type DragEvent, type KeyboardEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+  type KeyboardEvent,
+} from "react";
 import {
   LOGICAL_KEYS,
   type AppConfig,
@@ -60,9 +67,13 @@ export function KeySequenceEditor({
 }: KeySequenceEditorProps) {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [captureArmed, setCaptureArmed] = useState(false);
   const [captureError, setCaptureError] = useState<string | null>(null);
   const draggedKey = useRef<LogicalKey | null>(null);
   const chipRefs = useRef(new Map<LogicalKey, HTMLLIElement>());
+  const addKeyRef = useRef<HTMLButtonElement>(null);
+  const pickerRef = useRef<HTMLDivElement>(null);
+  const captureRef = useRef<HTMLButtonElement>(null);
 
   const filteredKeys = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -74,9 +85,19 @@ export function KeySequenceEditor({
 
   const openPicker = () => {
     setQuery("");
+    setCaptureArmed(false);
     setCaptureError(null);
     setPickerOpen(true);
   };
+
+  const closePicker = () => {
+    setPickerOpen(false);
+    addKeyRef.current?.focus();
+  };
+
+  useEffect(() => {
+    if (pickerOpen) captureRef.current?.focus();
+  }, [pickerOpen]);
 
   const selectKey = (key: LogicalKey) => {
     const existing = value.find(({ key: selected }) => selected === key);
@@ -86,13 +107,15 @@ export function KeySequenceEditor({
       return;
     }
     onChange([...value, { key, weight: 1 }]);
-    setPickerOpen(false);
+    closePicker();
   };
 
-  const capturePhysicalKey = (event: KeyboardEvent<HTMLDivElement>) => {
+  const capturePhysicalKey = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (!captureArmed) return;
     event.preventDefault();
+    event.stopPropagation();
     if (event.code === "Escape") {
-      setPickerOpen(false);
+      closePicker();
       return;
     }
     if (!isLogicalKey(event.code)) {
@@ -100,6 +123,33 @@ export function KeySequenceEditor({
       return;
     }
     selectKey(event.code);
+  };
+
+  const containDialogFocus = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.code === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closePicker();
+      return;
+    }
+    if (event.code !== "Tab") return;
+
+    const focusable = Array.from(
+      pickerRef.current?.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      ) ?? [],
+    );
+    if (focusable.length === 0) return;
+
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
   };
 
   const move = (index: number, offset: -1 | 1) => {
@@ -125,7 +175,12 @@ export function KeySequenceEditor({
           <h2 id="keys-title">Key sequence</h2>
           <p>Keys repeat in this order.</p>
         </div>
-        <button type="button" onClick={openPicker} disabled={disabled}>
+        <button
+          type="button"
+          onClick={openPicker}
+          disabled={disabled}
+          ref={addKeyRef}
+        >
           Add key
         </button>
       </div>
@@ -233,9 +288,9 @@ export function KeySequenceEditor({
             aria-describedby="key-picker-help"
             aria-labelledby="key-picker-title"
             aria-modal="true"
-            autoFocus
             className="key-picker"
-            onKeyDown={capturePhysicalKey}
+            onKeyDown={containDialogFocus}
+            ref={pickerRef}
             role="dialog"
             tabIndex={-1}
           >
@@ -246,18 +301,32 @@ export function KeySequenceEditor({
               </div>
               <button
                 aria-label="Close key picker"
-                onClick={() => setPickerOpen(false)}
+                onClick={closePicker}
                 type="button"
               >
                 ×
               </button>
             </div>
+            <button
+              aria-label="Physical key capture"
+              aria-pressed={captureArmed}
+              className="key-capture-surface"
+              onClick={() => {
+                setCaptureArmed(true);
+                setCaptureError(null);
+                captureRef.current?.focus();
+              }}
+              onKeyDown={capturePhysicalKey}
+              ref={captureRef}
+              type="button"
+            >
+              {captureArmed
+                ? "Press a supported key now"
+                : "Start physical key capture"}
+            </button>
             <input
               aria-label="Search keys"
               onChange={(event) => setQuery(event.currentTarget.value)}
-              onKeyDown={(event) => {
-                if (event.code !== "Escape") event.stopPropagation();
-              }}
               placeholder="Search letters, arrows, Space…"
               type="search"
               value={query}

@@ -9,9 +9,7 @@ function isWholeNumberInRange(value: number, minimum: number, maximum: number) {
 export function validateConfig(config: AppConfig): FieldErrors {
   const errors: FieldErrors = {};
 
-  if (config.keys.length === 0) {
-    errors.keys = "Choose at least one key";
-  } else if (
+  if (
     new Set(config.keys.map(({ key }) => key)).size !== config.keys.length
   ) {
     errors.keys = "Each key can appear only once";
@@ -64,5 +62,13 @@ export function validateConfig(config: AppConfig): FieldErrors {
     errors.stopAfter = "Choose a duration from 1 second to 24 hours";
   }
 
+  return errors;
+}
+
+export function validateConfigForStart(config: AppConfig): FieldErrors {
+  const errors = validateConfig(config);
+  if (config.keys.length === 0) {
+    errors.keys = "Choose at least one key";
+  }
   return errors;
 }

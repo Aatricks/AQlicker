@@ -144,6 +144,14 @@ ul {
   background: #2f8a4e;
 }
 
+.status-error {
+  color: #9b2c3b;
+}
+
+.status-error > span {
+  background: #c43d4b;
+}
+
 .configuration-stack {
   display: grid;
 }
@@ -429,6 +437,21 @@ ul {
   overflow-y: auto;
   list-style: none;
   padding: 0 4px 0 0;
+}
+
+.key-capture-surface {
+  width: 100%;
+  min-height: 58px;
+  border-style: dashed;
+  border-color: #8ca9df;
+  color: #174ca8;
+  background: #f5f8ff;
+}
+
+.key-capture-surface[aria-pressed="true"] {
+  border-style: solid;
+  border-color: #2563eb;
+  background: #eaf1ff;
 }
 
 .key-option {

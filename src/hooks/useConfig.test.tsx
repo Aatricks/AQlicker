@@ -37,6 +37,16 @@ function fakeApi(payload = bootstrap()) {
   } as unknown as AqlickerApi;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 afterEach(() => {
   vi.useRealTimers();
 });
@@ -94,6 +104,24 @@ describe("useConfig", () => {
     expect(api.saveConfig).not.toHaveBeenCalled();
   });
 
+  it("persists removal of the final key while retaining the start-only error", async () => {
+    const api = fakeApi();
+    const { result } = renderHook(() => useConfig(api));
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+
+    vi.useFakeTimers();
+    act(() => {
+      result.current.updateConfig((current) => ({ ...current, keys: [] }));
+    });
+    expect(result.current.errors.keys).toBeUndefined();
+    expect(result.current.startErrors.keys).toBe("Choose at least one key");
+
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(api.saveConfig).toHaveBeenCalledWith(
+      expect.objectContaining({ keys: [] }),
+    );
+  });
+
   it("registers a shortcut first and retains the previous value on rejection", async () => {
     const api = fakeApi();
     let resolveRegistration!: (value: string) => void;
@@ -128,5 +156,145 @@ describe("useConfig", () => {
     expect(result.current.config?.globalShortcut).toBe(
       "CommandOrControl+Alt+P",
     );
+  });
+
+  it("does not let an older save success replace the newer persisted marker", async () => {
+    const api = fakeApi();
+    const older = deferred<void>();
+    const newer = deferred<void>();
+    vi.mocked(api.saveConfig)
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise);
+    const { result } = renderHook(() => useConfig(api));
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+    vi.useFakeTimers();
+
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        timer: { intervalMs: 125 },
+      }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        timer: { intervalMs: 150 },
+      }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+
+    await act(async () => {
+      newer.resolve();
+      await newer.promise;
+      older.resolve();
+      await older.promise;
+    });
+
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        timer: { intervalMs: 125 },
+      }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(api.saveConfig).toHaveBeenCalledTimes(3);
+  });
+
+  it("ignores an older save failure after a newer save succeeds", async () => {
+    const api = fakeApi();
+    const older = deferred<void>();
+    const newer = deferred<void>();
+    vi.mocked(api.saveConfig)
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise);
+    const { result } = renderHook(() => useConfig(api));
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+    vi.useFakeTimers();
+
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        timer: { intervalMs: 125 },
+      }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        timer: { intervalMs: 150 },
+      }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+
+    await act(async () => {
+      newer.resolve();
+      await newer.promise;
+      older.reject(new Error("stale failure"));
+      await older.promise.catch(() => undefined);
+    });
+    expect(result.current.saveError).toBeNull();
+  });
+
+  it("does not let an older save success clear a newer save failure", async () => {
+    const api = fakeApi();
+    const older = deferred<void>();
+    const newer = deferred<void>();
+    vi.mocked(api.saveConfig)
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise);
+    const { result } = renderHook(() => useConfig(api));
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+    vi.useFakeTimers();
+
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        timer: { intervalMs: 125 },
+      }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        timer: { intervalMs: 150 },
+      }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+
+    await act(async () => {
+      newer.reject(new Error("newer failure"));
+      await newer.promise.catch(() => undefined);
+    });
+    expect(result.current.saveError).toBe("newer failure");
+
+    await act(async () => {
+      older.resolve();
+      await older.promise;
+    });
+    expect(result.current.saveError).toBe("newer failure");
+  });
+
+  it("ignores an in-flight save callback after unmount", async () => {
+    const api = fakeApi();
+    const saving = deferred<void>();
+    vi.mocked(api.saveConfig).mockReturnValueOnce(saving.promise);
+    const { result, unmount } = renderHook(() => useConfig(api));
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+    vi.useFakeTimers();
+
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        timer: { intervalMs: 125 },
+      }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    const lastVisibleError = result.current.saveError;
+    unmount();
+
+    saving.reject(new Error("after unmount"));
+    await saving.promise.catch(() => undefined);
+    expect(result.current.saveError).toBe(lastVisibleError);
   });
 });

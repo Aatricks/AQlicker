@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { AqlickerApi, BootstrapPayload } from "./api/aqlicker";
 import { DEFAULT_CONFIG } from "./domain/config";
@@ -55,5 +55,19 @@ describe("App", () => {
     expect(
       screen.getByRole("heading", { name: "Global shortcut" }),
     ).toBeVisible();
+  });
+
+  it("announces Unavailable rather than Ready when bootstrap fails", async () => {
+    const api = fakeApi();
+    vi.mocked(api.bootstrap).mockRejectedValueOnce(new Error("offline"));
+    render(<App api={api} />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent("Unavailable"),
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Could not load settings: offline",
+    );
+    expect(screen.queryByText("Ready")).not.toBeInTheDocument();
   });
 });

@@ -5,7 +5,10 @@ import {
   type BootstrapPayload,
 } from "../api/aqlicker";
 import type { AppConfig } from "../domain/config";
-import { validateConfig } from "../domain/validation";
+import {
+  validateConfig,
+  validateConfigForStart,
+} from "../domain/validation";
 
 type ConfigUpdater = AppConfig | ((current: AppConfig) => AppConfig);
 
@@ -25,6 +28,16 @@ export function useConfig(api: AqlickerApi = aqlickerApi) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const persistedConfig = useRef<string | null>(null);
+  const mounted = useRef(false);
+  const saveGeneration = useRef(0);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      saveGeneration.current += 1;
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -53,8 +66,13 @@ export function useConfig(api: AqlickerApi = aqlickerApi) {
     () => (config ? validateConfig(config) : {}),
     [config],
   );
+  const startErrors = useMemo(
+    () => (config ? validateConfigForStart(config) : {}),
+    [config],
+  );
 
   useEffect(() => {
+    const generation = ++saveGeneration.current;
     if (!config || Object.keys(errors).length > 0) return;
 
     const serialized = JSON.stringify(config);
@@ -64,10 +82,17 @@ export function useConfig(api: AqlickerApi = aqlickerApi) {
       void api
         .saveConfig(config)
         .then(() => {
+          if (!mounted.current || generation !== saveGeneration.current) {
+            return;
+          }
           persistedConfig.current = serialized;
           setSaveError(null);
         })
-        .catch((error: unknown) => setSaveError(errorMessage(error)));
+        .catch((error: unknown) => {
+          if (mounted.current && generation === saveGeneration.current) {
+            setSaveError(errorMessage(error));
+          }
+        });
     }, 250);
 
     return () => window.clearTimeout(timeout);
@@ -83,10 +108,12 @@ export function useConfig(api: AqlickerApi = aqlickerApi) {
   const registerShortcut = useCallback(
     async (candidate: string) => {
       const registered = await api.setShortcut(candidate);
-      updateConfig((current) => ({
-        ...current,
-        globalShortcut: registered,
-      }));
+      if (mounted.current) {
+        updateConfig((current) => ({
+          ...current,
+          globalShortcut: registered,
+        }));
+      }
       return registered;
     },
     [api, updateConfig],
@@ -96,6 +123,7 @@ export function useConfig(api: AqlickerApi = aqlickerApi) {
     bootstrap: bootstrapPayload,
     config,
     errors,
+    startErrors,
     loading,
     loadError,
     saveError,

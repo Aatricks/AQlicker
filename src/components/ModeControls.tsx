@@ -8,12 +8,25 @@ interface ModeControlsProps {
   errors?: FieldErrors;
 }
 
-const DEFAULT_ADVANCED: NaturalOverrides = {
-  minIntervalMs: 80,
-  maxIntervalMs: 450,
-  burstIntensity: 40,
-  pauseChancePercent: 5,
-};
+function interpolate(start: number, end: number, naturalness: number) {
+  return Math.floor(
+    (start * (100 - naturalness) + end * naturalness + 50) / 100,
+  );
+}
+
+function naturalOverridesFromSlider(naturalness: number): NaturalOverrides {
+  const pauseChanceBasisPoints = interpolate(100, 1_200, naturalness);
+  return {
+    minIntervalMs: interpolate(140, 55, naturalness),
+    maxIntervalMs: interpolate(220, 480, naturalness),
+    burstIntensity: interpolate(8, 100, naturalness),
+    pauseChancePercent: Math.floor((pauseChanceBasisPoints + 50) / 100),
+  };
+}
+
+function errorId(field: string) {
+  return `mode-error-${field.replace(/[^a-z0-9]+/gi, "-")}`;
+}
 
 export function ModeControls({
   config,
@@ -21,6 +34,10 @@ export function ModeControls({
   disabled = false,
   errors = {},
 }: ModeControlsProps) {
+  const describedBy = (...fields: string[]) => {
+    const ids = fields.filter((field) => errors[field]).map(errorId);
+    return ids.length > 0 ? ids.join(" ") : undefined;
+  };
   const updateAdvanced = <Key extends keyof NaturalOverrides>(
     field: Key,
     value: NaturalOverrides[Key],
@@ -30,14 +47,17 @@ export function ModeControls({
       natural: {
         ...config.natural,
         advanced: {
-          ...(config.natural.advanced ?? DEFAULT_ADVANCED),
+          ...(config.natural.advanced ??
+            naturalOverridesFromSlider(config.natural.naturalness)),
           [field]: value,
         },
       },
     });
   };
 
-  const advanced = config.natural.advanced ?? DEFAULT_ADVANCED;
+  const advanced =
+    config.natural.advanced ??
+    naturalOverridesFromSlider(config.natural.naturalness);
 
   return (
     <section className="config-section mode-controls" aria-labelledby="mode-title">
@@ -66,6 +86,7 @@ export function ModeControls({
         <label className="field-row">
           <span>Timer interval (ms)</span>
           <input
+            aria-describedby={describedBy("timer.intervalMs")}
             aria-invalid={Boolean(errors["timer.intervalMs"])}
             disabled={disabled}
             max={60_000}
@@ -87,6 +108,7 @@ export function ModeControls({
               Naturalness <output>{config.natural.naturalness}</output>
             </span>
             <input
+              aria-describedby={describedBy("natural.naturalness")}
               aria-label="Naturalness"
               aria-invalid={Boolean(errors["natural.naturalness"])}
               disabled={disabled}
@@ -113,6 +135,10 @@ export function ModeControls({
               <label>
                 <span>Minimum interval (ms)</span>
                 <input
+                  aria-describedby={describedBy(
+                    "natural.advanced.minIntervalMs",
+                    "natural.advanced",
+                  )}
                   aria-invalid={Boolean(
                     errors["natural.advanced.minIntervalMs"] ||
                       errors["natural.advanced"],
@@ -133,6 +159,10 @@ export function ModeControls({
               <label>
                 <span>Maximum interval (ms)</span>
                 <input
+                  aria-describedby={describedBy(
+                    "natural.advanced.maxIntervalMs",
+                    "natural.advanced",
+                  )}
                   aria-invalid={Boolean(
                     errors["natural.advanced.maxIntervalMs"] ||
                       errors["natural.advanced"],
@@ -153,6 +183,9 @@ export function ModeControls({
               <label>
                 <span>Burst intensity</span>
                 <input
+                  aria-describedby={describedBy(
+                    "natural.advanced.burstIntensity",
+                  )}
                   aria-invalid={Boolean(
                     errors["natural.advanced.burstIntensity"],
                   )}
@@ -172,6 +205,9 @@ export function ModeControls({
               <label>
                 <span>Pause chance (%)</span>
                 <input
+                  aria-describedby={describedBy(
+                    "natural.advanced.pauseChancePercent",
+                  )}
                   aria-invalid={Boolean(
                     errors["natural.advanced.pauseChancePercent"],
                   )}
@@ -198,7 +234,7 @@ export function ModeControls({
           field.startsWith(config.mode === "timer" ? "timer." : "natural."),
         )
         .map(([field, message]) => (
-          <p className="field-error" key={field}>
+          <p className="field-error" id={errorId(field)} key={field}>
             {message}
           </p>
         ))}
