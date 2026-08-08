@@ -66,24 +66,39 @@ mod tests {
     fn timer_wraps_without_offset_drift() {
         let keys = entries(&[(LogicalKey::KeyA, 1), (LogicalKey::Space, 1)]);
         let mut timer = TimerSchedule::new(&keys, Duration::from_millis(100));
-        // Driven the way the worker does it: plan, then report the press
-        // emitted at the planned instant.
-        let mut press = |timer: &mut TimerSchedule, now: u64| {
+        // Driven the way the worker does it: plan at the instant the run has
+        // reached, then report the press emitted that much later. A real
+        // emission is never exactly on time, so no latency here is zero.
+        let mut press = |timer: &mut TimerSchedule, now: u64, latency: u64| {
             let plan = timer.next_press(Duration::from_millis(now));
-            timer.record_press(plan.target_offset);
+            timer.record_press(plan.target_offset + Duration::from_millis(latency));
             plan
         };
+        // A couple of milliseconds late every time: the pace stays exact
+        // instead of charging each press the lateness of the one before it.
         assert_eq!(
-            press(&mut timer, 0),
+            press(&mut timer, 0, 2),
             PressPlan::new(LogicalKey::KeyA, 0, 30)
         );
         assert_eq!(
-            press(&mut timer, 30),
+            press(&mut timer, 32, 2),
             PressPlan::new(LogicalKey::Space, 100, 30)
         );
         assert_eq!(
-            press(&mut timer, 130),
+            press(&mut timer, 132, 2),
             PressPlan::new(LogicalKey::KeyA, 200, 30)
+        );
+        // Planned for 300 ms but emitted at 1,200 ms, nine intervals late, as a
+        // focus pause leaves it. The next press is a whole interval after that
+        // press: not the stale 400 ms the accumulator was holding, and not a
+        // catch-up burst.
+        assert_eq!(
+            press(&mut timer, 232, 900),
+            PressPlan::new(LogicalKey::Space, 300, 30)
+        );
+        assert_eq!(
+            press(&mut timer, 1_230, 2),
+            PressPlan::new(LogicalKey::KeyA, 1_300, 30)
         );
     }
 
