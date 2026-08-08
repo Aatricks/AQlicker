@@ -78,4 +78,27 @@ describe("configuration contract", () => {
     ]));
     expect(validateConfigForStart(DEFAULT_CONFIG)).toContainEqual({ field: "keys", code: "required" });
   });
+
+  it("caps advanced pause chance at twenty-five percent", () => {
+    const configWithPauseChance = (pauseChancePercent: number): AppConfig => ({
+      ...DEFAULT_CONFIG,
+      natural: {
+        naturalness: 50,
+        advanced: {
+          minIntervalMs: 100,
+          maxIntervalMs: 500,
+          burstIntensity: 50,
+          pauseChancePercent,
+        },
+      },
+    });
+
+    expect(validateConfig(configWithPauseChance(25))).toEqual([]);
+    for (const pauseChancePercent of [26, 100]) {
+      expect(validateConfig(configWithPauseChance(pauseChancePercent))).toContainEqual({
+        field: "natural.advanced.pauseChancePercent",
+        code: "range",
+      });
+    }
+  });
 });

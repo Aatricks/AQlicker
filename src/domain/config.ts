@@ -12,6 +12,8 @@ export const LOGICAL_KEYS = [
 export type LogicalKey = (typeof LOGICAL_KEYS)[number];
 export type Mode = "timer" | "natural";
 
+const MAX_PAUSE_CHANCE_PERCENT = 25;
+
 export interface NaturalOverrides {
   minIntervalMs: number;
   maxIntervalMs: number;
@@ -84,7 +86,7 @@ export function validateConfig(config: AppConfig): ValidationError[] {
     if (!Number.isInteger(advanced.burstIntensity) || advanced.burstIntensity < 0 || advanced.burstIntensity > 100) {
       errors.push({ field: "natural.advanced.burstIntensity", code: "range" });
     }
-    if (!Number.isInteger(advanced.pauseChancePercent) || advanced.pauseChancePercent < 0 || advanced.pauseChancePercent > 100) {
+    if (!Number.isInteger(advanced.pauseChancePercent) || advanced.pauseChancePercent < 0 || advanced.pauseChancePercent > MAX_PAUSE_CHANCE_PERCENT) {
       errors.push({ field: "natural.advanced.pauseChancePercent", code: "range" });
     }
   }

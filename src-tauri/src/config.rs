@@ -8,6 +8,7 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 const MIN_INTERVAL_MS: u32 = 40;
 const MAX_TIMER_INTERVAL_MS: u32 = 60_000;
 const MAX_NATURAL_INTERVAL_MS: u32 = 5_000;
+const MAX_PAUSE_CHANCE_PERCENT: u8 = 25;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -94,7 +95,7 @@ impl AppConfig {
                     "range",
                 ));
             }
-            if advanced.pause_chance_percent > 100 {
+            if advanced.pause_chance_percent > MAX_PAUSE_CHANCE_PERCENT {
                 errors.push(ValidationError::new(
                     "natural.advanced.pauseChancePercent",
                     "range",
@@ -244,5 +245,32 @@ mod tests {
                 .iter()
                 .any(|error| error.field == "keys" && error.code == "required")
         );
+    }
+
+    #[test]
+    fn config_validation_caps_pause_chance_at_twenty_five_percent() {
+        let config_with_pause_chance = |pause_chance_percent| AppConfig {
+            natural: NaturalConfig {
+                naturalness: 50,
+                advanced: Some(NaturalOverrides {
+                    min_interval_ms: 100,
+                    max_interval_ms: 500,
+                    burst_intensity: 50,
+                    pause_chance_percent,
+                }),
+            },
+            ..AppConfig::default()
+        };
+
+        assert!(config_with_pause_chance(25).validate().is_empty());
+        for pause_chance_percent in [26, 100] {
+            assert!(
+                config_with_pause_chance(pause_chance_percent)
+                    .validate()
+                    .iter()
+                    .any(|error| error.field == "natural.advanced.pauseChancePercent"
+                        && error.code == "range")
+            );
+        }
     }
 }
