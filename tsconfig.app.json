@@ -10,6 +10,7 @@
     "allowSyntheticDefaultImports": true,
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "resolveJsonModule": true,
     "allowImportingTsExtensions": false,
     "isolatedModules": true,
     "moduleDetection": "force",
