@@ -26,12 +26,17 @@ impl PressPlan {
 }
 
 pub trait PressSchedule: Send {
-    fn next_press(&mut self) -> PressPlan;
+    /// Plans the next press. `now` is how long the run has been going, and is
+    /// the single clock everything here is measured against: the returned
+    /// `target_offset`, the automatic-stop deadline, and the emission instants
+    /// reported to [`PressSchedule::record_press`].
+    fn next_press(&mut self, now: Duration) -> PressPlan;
 
-    /// Reports that the press just planned was emitted, `at` this many
-    /// milliseconds into the run. Schedules with a wall-clock constraint start
-    /// it here; the timer schedule has none.
-    fn record_press(&mut self, _at: Duration) {}
+    /// Reports that the press just planned was emitted, `at` this far into the
+    /// run. Emissions are always at least a little late, so this is what
+    /// anchors the plan to reality: the next press stays a full interval after
+    /// the one that really happened, and a cooldown starts from it.
+    fn record_press(&mut self, at: Duration);
 }
 
 pub fn is_before_deadline(plan: &PressPlan, deadline: Option<Duration>) -> bool {
@@ -61,13 +66,23 @@ mod tests {
     fn timer_wraps_without_offset_drift() {
         let keys = entries(&[(LogicalKey::KeyA, 1), (LogicalKey::Space, 1)]);
         let mut timer = TimerSchedule::new(&keys, Duration::from_millis(100));
-        assert_eq!(timer.next_press(), PressPlan::new(LogicalKey::KeyA, 0, 30));
+        // Driven the way the worker does it: plan, then report the press
+        // emitted at the planned instant.
+        let mut press = |timer: &mut TimerSchedule, now: u64| {
+            let plan = timer.next_press(Duration::from_millis(now));
+            timer.record_press(plan.target_offset);
+            plan
+        };
         assert_eq!(
-            timer.next_press(),
+            press(&mut timer, 0),
+            PressPlan::new(LogicalKey::KeyA, 0, 30)
+        );
+        assert_eq!(
+            press(&mut timer, 30),
             PressPlan::new(LogicalKey::Space, 100, 30)
         );
         assert_eq!(
-            timer.next_press(),
+            press(&mut timer, 130),
             PressPlan::new(LogicalKey::KeyA, 200, 30)
         );
     }
@@ -77,8 +92,8 @@ mod tests {
         let keys = entries(&[(LogicalKey::KeyA, 1), (LogicalKey::KeyB, 3)]);
         let mut a = NaturalSchedule::seeded(&keys, NaturalSettings::from_slider(50), 7);
         let mut b = NaturalSchedule::seeded(&keys, NaturalSettings::from_slider(50), 7);
-        let left: Vec<_> = (0..1_000).map(|_| a.next_press()).collect();
-        let right: Vec<_> = (0..1_000).map(|_| b.next_press()).collect();
+        let left: Vec<_> = (0..1_000).map(|_| a.next_press(Duration::ZERO)).collect();
+        let right: Vec<_> = (0..1_000).map(|_| b.next_press(Duration::ZERO)).collect();
         assert_eq!(left, right);
         assert!(
             !left
@@ -98,9 +113,10 @@ mod tests {
             (LogicalKey::KeyC, 6),
         ]);
         let mut schedule = NaturalSchedule::seeded(&keys, NaturalSettings::from_slider(50), 0x601D);
+        let mut emitter = Emitter::new(&[0]);
         let plans: Vec<(LogicalKey, u64, u64)> = (0..20)
             .map(|_| {
-                let plan = press(&mut schedule);
+                let plan = emitter.press(&mut schedule).0;
                 (
                     plan.key,
                     plan.target_offset.as_millis() as u64,
@@ -136,12 +152,39 @@ mod tests {
         );
     }
 
-    /// Drives the schedule the way the worker does: plan a press, then report
-    /// that it was emitted at the instant it was planned for.
-    fn press(schedule: &mut NaturalSchedule) -> PressPlan {
-        let plan = schedule.next_press();
-        schedule.record_press(plan.target_offset);
-        plan
+    /// Stands in for the worker loop: plans at the instant the run has reached,
+    /// then reports the press emitted some latency after the instant it was
+    /// planned for. Real emissions are always at least a little late and the
+    /// lateness varies, so a fixed zero latency describes a run that cannot
+    /// happen -- the cooldown tests cycle real ones.
+    struct Emitter {
+        now: Duration,
+        latencies: Vec<Duration>,
+        presses: usize,
+    }
+
+    impl Emitter {
+        fn new(latencies: &[u64]) -> Self {
+            Self {
+                now: Duration::ZERO,
+                latencies: latencies
+                    .iter()
+                    .map(|&ms| Duration::from_millis(ms))
+                    .collect(),
+                presses: 0,
+            }
+        }
+
+        /// Returns the plan and the instant the press was actually emitted.
+        fn press(&mut self, schedule: &mut NaturalSchedule) -> (PressPlan, Duration) {
+            let plan = schedule.next_press(self.now);
+            let latency = self.latencies[self.presses % self.latencies.len()];
+            self.presses += 1;
+            let at = plan.target_offset.saturating_add(latency);
+            schedule.record_press(at);
+            self.now = at;
+            (plan, at)
+        }
     }
 
     fn cooling_entries(entries: &[(LogicalKey, u8, u32)]) -> Vec<KeyEntry> {
@@ -173,21 +216,24 @@ mod tests {
     fn a_cooling_single_key_paces_presses_to_its_cooldown() {
         let keys = cooling_entries(&[(LogicalKey::KeyA, 1, 1_000)]);
         let mut schedule = NaturalSchedule::seeded(&keys, NaturalSettings::from_slider(50), 5);
-        let plans: Vec<_> = (0..50).map(|_| press(&mut schedule)).collect();
+        // Varying emission latency, the way a real run behaves. The cooldown is
+        // measured from the press, so it must hold between actual emissions
+        // however early or late any one of them lands.
+        let mut emitter = Emitter::new(&[0, 37, 5, 120, 12]);
+        let emissions: Vec<_> = (0..50).map(|_| emitter.press(&mut schedule).1).collect();
 
-        for window in plans.windows(2) {
-            let gap = window[1].target_offset - window[0].target_offset;
+        for window in emissions.windows(2) {
+            let gap = window[1] - window[0];
             assert!(
                 gap >= Duration::from_millis(1_000),
-                "gap {gap:?} is shorter than the cooldown"
+                "gap {gap:?} is shorter than the cooldown: {emissions:?}"
             );
         }
         assert!(
-            plans
+            emissions
                 .windows(2)
-                .any(|window| window[1].target_offset - window[0].target_offset
-                    == Duration::from_millis(1_000)),
-            "the cooldown must set the pace, not merely bound it"
+                .any(|window| window[1] - window[0] < Duration::from_millis(1_200)),
+            "the cooldown must set the pace, not merely bound it: {emissions:?}"
         );
     }
 
@@ -195,9 +241,10 @@ mod tests {
     fn every_key_cooling_waits_for_the_earliest_expiry() {
         let keys = cooling_entries(&[(LogicalKey::KeyA, 1, 1_000), (LogicalKey::KeyB, 1, 5_000)]);
         let mut schedule = NaturalSchedule::seeded(&keys, fixed_interval_settings(), 3);
+        let mut emitter = Emitter::new(&[0]);
         let plans: Vec<_> = (0..9)
             .map(|_| {
-                let plan = press(&mut schedule);
+                let plan = emitter.press(&mut schedule).0;
                 (plan.key, plan.target_offset.as_millis() as u64)
             })
             .collect();
@@ -232,9 +279,10 @@ mod tests {
         ]);
         let expected = repeat_capped_reference(&[1, 3]);
         let mut schedule = NaturalSchedule::seeded(&keys, NaturalSettings::from_slider(50), 0xC001);
+        let mut emitter = Emitter::new(&[0]);
         let mut counts = [0_u64; 3];
         for _ in 0..100_000 {
-            let index = match press(&mut schedule).key {
+            let index = match emitter.press(&mut schedule).0.key {
                 LogicalKey::KeyA => 0,
                 LogicalKey::KeyB => 1,
                 LogicalKey::KeyC => 2,
@@ -267,7 +315,9 @@ mod tests {
     fn natural_single_key_remains_stable_past_the_repeat_counter_range() {
         let keys = entries(&[(LogicalKey::KeyA, 1)]);
         let mut schedule = NaturalSchedule::seeded(&keys, NaturalSettings::from_slider(50), 11);
-        let plans: Vec<_> = (0..1_000).map(|_| schedule.next_press()).collect();
+        let plans: Vec<_> = (0..1_000)
+            .map(|_| schedule.next_press(Duration::ZERO))
+            .collect();
         assert!(plans.iter().all(|plan| plan.key == LogicalKey::KeyA));
     }
 
@@ -377,8 +427,8 @@ mod tests {
     fn timer_and_natural_deadlines_are_exclusive() {
         let keys = entries(&[(LogicalKey::KeyA, 1)]);
         let mut timer = TimerSchedule::new(&keys, Duration::from_millis(100));
-        let timer_at_zero = timer.next_press();
-        let timer_at_deadline = timer.next_press();
+        let timer_at_zero = timer.next_press(Duration::ZERO);
+        let timer_at_deadline = timer.next_press(Duration::ZERO);
         assert!(is_before_deadline(
             &timer_at_zero,
             Some(Duration::from_millis(100))
@@ -389,8 +439,8 @@ mod tests {
         ));
 
         let mut natural = NaturalSchedule::seeded(&keys, NaturalSettings::from_slider(50), 19);
-        let natural_at_zero = natural.next_press();
-        let natural_later = natural.next_press();
+        let natural_at_zero = natural.next_press(Duration::ZERO);
+        let natural_later = natural.next_press(Duration::ZERO);
         assert!(!is_before_deadline(&natural_at_zero, Some(Duration::ZERO)));
         assert!(!is_before_deadline(
             &natural_later,
@@ -423,7 +473,9 @@ mod tests {
     fn assert_sample_bounds(settings: NaturalSettings, seed: u64) {
         let keys = entries(&[(LogicalKey::KeyA, 1), (LogicalKey::KeyB, 1)]);
         let mut schedule = NaturalSchedule::seeded(&keys, settings, seed);
-        let plans: Vec<_> = (0..=100_000).map(|_| schedule.next_press()).collect();
+        let plans: Vec<_> = (0..=100_000)
+            .map(|_| schedule.next_press(Duration::ZERO))
+            .collect();
         let minimum_hold = settings
             .min_hold_ms()
             .min(settings.min_interval_ms().saturating_sub(10));
@@ -458,9 +510,10 @@ mod tests {
         let expected = repeat_capped_reference(&weights);
         let mut schedule =
             NaturalSchedule::seeded(&keys, NaturalSettings::from_slider(50), 0xA11CE);
+        let mut emitter = Emitter::new(&[0]);
         let mut counts = [0_u64; 3];
         for _ in 0..100_000 {
-            let index = match press(&mut schedule).key {
+            let index = match emitter.press(&mut schedule).0.key {
                 LogicalKey::KeyA => 0,
                 LogicalKey::KeyB => 1,
                 LogicalKey::KeyC => 2,

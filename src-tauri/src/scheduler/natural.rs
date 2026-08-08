@@ -90,22 +90,19 @@ fn interpolate(start: u64, end: u64, naturalness: u8) -> u64 {
 
 pub struct NaturalSchedule {
     keys: Vec<KeyEntry>,
-    /// Wall-clock instant, parallel to `keys`, from which each key may be
-    /// selected again. A zero cooldown leaves this at or behind the current
-    /// instant forever, so the schedule behaves exactly as it did before.
+    /// Instant, parallel to `keys`, from which each key may be selected again,
+    /// measured like everything else here in run elapsed time. A zero cooldown
+    /// leaves it at or behind the press it was stamped from, so the schedule
+    /// behaves exactly as it did before cooldowns existed.
     available_at_ms: Vec<u64>,
-    /// How far the run's real elapsed time has drifted ahead of the schedule's
-    /// own offsets, almost always because the run paused for its target
-    /// application. Schedule offsets exclude it, wall-clock cooldowns include it.
-    pause_credit_ms: u64,
-    /// The key handed out by the last `next_press`, and the offset it was
-    /// planned for. Its cooldown is stamped once the worker reports the press
-    /// actually happened, not when it was planned.
+    /// The key handed out by the last `next_press`, and the interval planned
+    /// after it. Both are settled once the worker reports the press actually
+    /// happened.
     pending: Option<usize>,
-    last_plan_offset_ms: u64,
+    pending_interval_ms: u64,
     settings: NaturalSettings,
     rng: ChaCha8Rng,
-    target_offset_ms: u64,
+    next_at_ms: u64,
     previous_normal_ms: Option<u64>,
     last_key: Option<LogicalKey>,
     repeat_count: u8,
@@ -164,12 +161,11 @@ impl NaturalSchedule {
         Self {
             keys: keys.to_vec(),
             available_at_ms: vec![0; keys.len()],
-            pause_credit_ms: 0,
             pending: None,
-            last_plan_offset_ms: 0,
+            pending_interval_ms: 0,
             settings,
             rng: ChaCha8Rng::seed_from_u64(seed),
-            target_offset_ms: 0,
+            next_at_ms: 0,
             previous_normal_ms: None,
             last_key: None,
             repeat_count: 0,
@@ -179,27 +175,22 @@ impl NaturalSchedule {
         }
     }
 
-    const fn wall_now(&self) -> u64 {
-        self.target_offset_ms + self.pause_credit_ms
-    }
-
+    /// Whether the key may be selected for the instant currently being planned.
     fn is_available(&self, index: usize) -> bool {
-        self.available_at_ms[index] <= self.wall_now()
+        self.available_at_ms[index] <= self.next_at_ms
     }
 
     fn choose_key(&mut self) -> LogicalKey {
         // The cooldown is a hard constraint: with every key cooling, the whole
         // schedule waits for the earliest expiry rather than pressing early.
-        // Reaching this branch means every expiry is past `wall_now`, so the
-        // earliest of them is always ahead of the current offset: the offset
-        // only ever moves forward, never back onto an instant already waited out.
+        // Reaching this branch means every expiry is past the planned instant,
+        // so this only ever moves the plan forward.
         if !(0..self.keys.len()).any(|index| self.is_available(index)) {
-            let earliest = *self
+            self.next_at_ms = *self
                 .available_at_ms
                 .iter()
                 .min()
                 .expect("a natural schedule has at least one key");
-            self.target_offset_ms = earliest.saturating_sub(self.pause_credit_ms);
         }
         // The repeat cap is a soft constraint by comparison: it yields when the
         // only key still available is the one it wants to hold back.
@@ -313,28 +304,31 @@ impl NaturalSchedule {
 }
 
 impl PressSchedule for NaturalSchedule {
-    fn next_press(&mut self) -> PressPlan {
+    fn next_press(&mut self, now: Duration) -> PressPlan {
+        // The planned timeline never runs behind reality: whatever held the run
+        // up -- a focus pause, a slow emission -- moves it forward instead of
+        // being replayed as a catch-up burst. Intervals still accumulate from
+        // the plan, so they do not drift.
+        self.next_at_ms = self.next_at_ms.max(now.as_millis() as u64);
         let key = self.choose_key();
         let interval_ms = self.next_interval();
         let sampled_hold = self
             .rng
             .random_range(self.settings.min_hold_ms..=self.settings.max_hold_ms);
         let hold_ms = sampled_hold.min(interval_ms.saturating_sub(MIN_RELEASE_GAP_MS));
-        let plan = PressPlan::new(key, self.target_offset_ms, hold_ms);
-        self.last_plan_offset_ms = self.target_offset_ms;
-        self.target_offset_ms = self.target_offset_ms.saturating_add(interval_ms);
+        let plan = PressPlan::new(key, self.next_at_ms, hold_ms);
+        self.pending_interval_ms = interval_ms;
+        self.next_at_ms = self.next_at_ms.saturating_add(interval_ms);
         plan
     }
 
-    /// The cooldown runs from the instant the key was really pressed. Whatever
-    /// the run spent between the planned offset and that instant -- a focus
-    /// pause, almost always -- is also how far real time now leads the
-    /// schedule's own offsets, so the same report keeps both in step.
+    /// The cooldown runs from the instant the key was really pressed, and the
+    /// next press stays a whole interval after it, in that same clock.
     fn record_press(&mut self, at: Duration) {
         let at_ms = at.as_millis() as u64;
-        self.pause_credit_ms = self
-            .pause_credit_ms
-            .max(at_ms.saturating_sub(self.last_plan_offset_ms));
+        self.next_at_ms = self
+            .next_at_ms
+            .max(at_ms.saturating_add(self.pending_interval_ms));
         if let Some(index) = self.pending.take() {
             self.available_at_ms[index] =
                 at_ms.saturating_add(u64::from(self.keys[index].cooldown_ms));

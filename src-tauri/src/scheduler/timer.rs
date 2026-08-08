@@ -8,7 +8,7 @@ pub struct TimerSchedule {
     keys: Vec<LogicalKey>,
     interval: Duration,
     key_index: usize,
-    press_count: u64,
+    next_at: Duration,
 }
 
 impl TimerSchedule {
@@ -21,31 +21,29 @@ impl TimerSchedule {
             keys: keys.iter().map(|entry| entry.key).collect(),
             interval,
             key_index: 0,
-            press_count: 0,
+            next_at: Duration::ZERO,
         }
     }
 }
 
 impl PressSchedule for TimerSchedule {
-    fn next_press(&mut self) -> PressPlan {
-        let count = self.press_count;
-        self.press_count = self.press_count.saturating_add(1);
+    fn next_press(&mut self, now: Duration) -> PressPlan {
+        // The planned timeline never runs behind reality: whatever held the run
+        // up moves it forward instead of being replayed as a catch-up burst.
+        // Intervals still accumulate from the plan, so they do not drift.
+        self.next_at = self.next_at.max(now);
         let key = self.keys[self.key_index];
         self.key_index = (self.key_index + 1) % self.keys.len();
-        PressPlan {
+        let plan = PressPlan {
             key,
-            target_offset: duration_times(self.interval, count),
+            target_offset: self.next_at,
             hold_for: Duration::from_millis(30),
-        }
+        };
+        self.next_at = self.next_at.saturating_add(self.interval);
+        plan
     }
-}
 
-fn duration_times(interval: Duration, count: u64) -> Duration {
-    let nanoseconds = interval.as_nanos().saturating_mul(u128::from(count));
-    let seconds = nanoseconds / 1_000_000_000;
-    if seconds > u128::from(u64::MAX) {
-        Duration::MAX
-    } else {
-        Duration::new(seconds as u64, (nanoseconds % 1_000_000_000) as u32)
+    fn record_press(&mut self, at: Duration) {
+        self.next_at = self.next_at.max(at.saturating_add(self.interval));
     }
 }

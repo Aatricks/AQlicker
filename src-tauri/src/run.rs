@@ -18,8 +18,7 @@ use crate::{
     focus::{FocusProbe, UnknownFocus, system_focus_probe},
     input::{EnigoInputSink, InputFailure, InputSink},
     scheduler::{
-        NaturalSchedule, NaturalSettings, PressPlan, PressSchedule, TimerSchedule,
-        is_before_deadline,
+        NaturalSchedule, NaturalSettings, PressSchedule, TimerSchedule, is_before_deadline,
     },
 };
 
@@ -638,17 +637,9 @@ fn execute_schedule(
     clock: &dyn Clock,
     press_state: &mut PressState,
 ) -> WorkerExit {
-    // Time spent paused. Adding it to every planned offset resumes the schedule
-    // from the actual emission time instead of replaying the presses the run
-    // slept through as a catch-up burst.
-    let mut paused_for = Duration::ZERO;
     loop {
         press_state.failure_phase = FailurePhase::Runtime;
-        let plan = schedule.next_press();
-        let plan = PressPlan {
-            target_offset: plan.target_offset.saturating_add(paused_for),
-            ..plan
-        };
+        let plan = schedule.next_press(clock.elapsed());
         if !is_before_deadline(&plan, deadline) {
             if deadline.is_some_and(|deadline| clock.wait_until(deadline, receiver)) {
                 return WorkerExit::Idle(StopReason::Requested);
@@ -657,10 +648,12 @@ fn execute_schedule(
         }
         // A cooldown can hold the worker for up to a minute. Republish the run
         // clock across the wait, the way the pause gate does, so elapsed and
-        // remaining time keep moving instead of freezing between presses.
-        while plan.target_offset.saturating_sub(clock.elapsed()) > PAUSE_POLL_INTERVAL {
+        // remaining time keep moving instead of freezing between presses. A
+        // cancel arriving mid-wait must return here: the chunk consumes it, so
+        // dropping out into the wait below would lose it and never stop.
+        while plan.target_offset.saturating_sub(clock.elapsed()) > PROGRESS_PUBLISH_INTERVAL {
             if clock.wait_until(
-                clock.elapsed().saturating_add(PAUSE_POLL_INTERVAL),
+                clock.elapsed().saturating_add(PROGRESS_PUBLISH_INTERVAL),
                 receiver,
             ) {
                 return WorkerExit::Idle(StopReason::Requested);
@@ -685,7 +678,7 @@ fn execute_schedule(
                 Pause::DeadlineReached => {
                     return WorkerExit::Idle(StopReason::DurationComplete);
                 }
-                Pause::Ready(waited) => paused_for = paused_for.saturating_add(waited),
+                Pause::Ready => {}
             }
         }
 
@@ -693,8 +686,13 @@ fn execute_schedule(
             return input_failure(plan.key, failure, FailurePhase::Runtime);
         }
         press_state.down_key = Some(plan.key);
-        schedule.record_press(clock.elapsed());
-        if clock.wait_until(plan.target_offset.saturating_add(plan.hold_for), receiver) {
+        // Hold from the instant the key actually went down, not from the
+        // instant it was planned for. A press emitted late -- after a focus
+        // pause, most visibly -- would otherwise be released with no hold at
+        // all, and a key held for no time may not register at all.
+        let pressed_at = clock.elapsed();
+        schedule.record_press(pressed_at);
+        if clock.wait_until(pressed_at.saturating_add(plan.hold_for), receiver) {
             return WorkerExit::Idle(StopReason::Requested);
         }
         press_state.failure_phase = FailurePhase::Cleanup;
@@ -713,8 +711,8 @@ fn execute_schedule(
 }
 
 enum Pause {
-    /// The target application is frontmost again after this much waiting.
-    Ready(Duration),
+    /// The target application is frontmost again.
+    Ready,
     Cancelled,
     DeadlineReached,
 }
@@ -723,6 +721,11 @@ enum Pause {
 /// Escape and the global toggle still arrive on the control channel, so they
 /// interrupt the sleep instead of waiting it out.
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// How often a long wait republishes the run clock. The interface renders
+/// whole seconds, so a slower rate would visibly stall it and a faster one
+/// would only add events nobody can see.
+const PROGRESS_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Holds the run between presses while `target` is not the frontmost
 /// application. The run stays `Running` and its elapsed time keeps counting, so
@@ -735,14 +738,13 @@ fn await_target(
     target: &TargetApp,
     deadline: Option<Duration>,
 ) -> Pause {
-    let entered = clock.elapsed();
     let mut published = false;
     loop {
         if lock(focus).frontmost().as_deref() == Some(target.id.as_str()) {
             if published {
                 publish_progress(shared, clock, None);
             }
-            return Pause::Ready(clock.elapsed().saturating_sub(entered));
+            return Pause::Ready;
         }
         if !published {
             published = true;
@@ -2172,6 +2174,155 @@ mod tests {
                 window[1] - window[0] >= Duration::from_millis(5_000),
                 "presses landed closer than the cooldown: {press_targets:?}"
             );
+        }
+    }
+
+    /// Emissions are always a little late in reality, and occasionally very
+    /// late. A cooldown is measured from the press, so a one-off delay must not
+    /// shorten the presses that follow it -- not the next one, and not the rest
+    /// of the run.
+    struct StallingSink {
+        clock: Arc<VirtualClock>,
+        press_targets: Arc<Mutex<Vec<Duration>>>,
+        stall_before_press: usize,
+        stall: Duration,
+    }
+
+    impl InputSink for StallingSink {
+        fn key_down(&mut self, _key: LogicalKey) -> Result<(), InputFailure> {
+            let mut press_targets = self.press_targets.lock().unwrap();
+            if press_targets.len() == self.stall_before_press {
+                let mut elapsed = self.clock.elapsed.lock().unwrap();
+                *elapsed = elapsed.saturating_add(self.stall);
+            }
+            press_targets.push(self.clock.elapsed());
+            Ok(())
+        }
+
+        fn key_up(&mut self, _key: LogicalKey) -> Result<(), InputFailure> {
+            Ok(())
+        }
+    }
+
+    struct HoldRecordingSink {
+        clock: Arc<VirtualClock>,
+        holds: Arc<Mutex<Vec<Duration>>>,
+        down_at: Option<Duration>,
+    }
+
+    impl InputSink for HoldRecordingSink {
+        fn key_down(&mut self, _key: LogicalKey) -> Result<(), InputFailure> {
+            self.down_at = Some(self.clock.elapsed());
+            Ok(())
+        }
+
+        fn key_up(&mut self, _key: LogicalKey) -> Result<(), InputFailure> {
+            let down_at = self.down_at.take().expect("key-up follows a key-down");
+            self.holds
+                .lock()
+                .unwrap()
+                .push(self.clock.elapsed().saturating_sub(down_at));
+            Ok(())
+        }
+    }
+
+    /// Separate from the cooldown work: the hold used to be waited out against
+    /// the instant the press was planned for, so a press emitted late -- after a
+    /// focus pause -- was released with no hold at all, and a key held for no
+    /// time may not register in the target application.
+    #[test]
+    fn a_press_delayed_by_a_pause_is_still_held_for_its_full_duration() {
+        let clock = Arc::new(VirtualClock::new());
+        let holds = Arc::new(Mutex::new(Vec::new()));
+        let mut script = vec![Some("com.apple.Safari"); 3];
+        script.push(Some("com.apple.TextEdit"));
+        let controller = controller_with_focus(
+            Box::new(HoldRecordingSink {
+                clock: Arc::clone(&clock),
+                holds: Arc::clone(&holds),
+                down_at: None,
+            }),
+            clock,
+            FakeFocus::new(&script),
+        );
+
+        controller.start(targeted_request(Mode::Timer)).unwrap();
+        controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        let holds = holds.lock().unwrap();
+        assert!(!holds.is_empty(), "the run emitted no press");
+        assert!(
+            holds.iter().all(|hold| *hold == Duration::from_millis(30)),
+            "a press was not held for its planned duration: {holds:?}"
+        );
+    }
+
+    #[test]
+    fn a_stop_while_a_cooldown_is_waited_out_is_immediate() {
+        let progressed = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut controller = RunController::for_test_with_clock(
+            Box::new(TimedRecordingSink {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(RealClock::new(Instant::now())),
+        );
+        let reached = Arc::clone(&progressed);
+        controller.set_observer(Arc::new(move |snapshot: RunSnapshot| {
+            if snapshot.successful_presses == 1 && snapshot.elapsed_ms >= 1_000 {
+                signal(&reached);
+            }
+        }));
+
+        // A minute of cooldown after the first press, so the run is certainly
+        // inside the chunked wait once it has published progress through it.
+        controller.start(cooling_request(60_000, 3_600)).unwrap();
+        assert!(
+            wait_until_true_for(&progressed, Duration::from_secs(5)),
+            "the run never published progress during the cooldown wait"
+        );
+        assert!(controller.stop());
+        let snapshot = controller
+            .wait_for_terminal(Duration::from_millis(500))
+            .unwrap();
+
+        assert_eq!(snapshot.status, RunStatus::Idle);
+        assert_eq!(snapshot.stop_reason, Some(StopReason::Requested));
+        assert_eq!(snapshot.successful_presses, 1);
+    }
+
+    #[test]
+    fn a_one_off_emission_delay_does_not_shorten_later_cooldowns() {
+        for stall in [Duration::from_millis(250), Duration::from_secs(3)] {
+            let clock = Arc::new(VirtualClock::new());
+            let press_targets = Arc::new(Mutex::new(Vec::new()));
+            let controller = RunController::for_test_with_clock(
+                Box::new(StallingSink {
+                    clock: Arc::clone(&clock),
+                    press_targets: Arc::clone(&press_targets),
+                    stall_before_press: 1,
+                    stall,
+                }),
+                clock,
+            );
+
+            controller.start(cooling_request(5_000, 40)).unwrap();
+            controller
+                .wait_for_terminal(Duration::from_secs(1))
+                .unwrap();
+
+            let press_targets = press_targets.lock().unwrap();
+            assert!(
+                press_targets.len() >= 6,
+                "{stall:?} stall left too few presses to judge: {press_targets:?}"
+            );
+            for window in press_targets.windows(2) {
+                assert!(
+                    window[1] - window[0] >= Duration::from_millis(5_000),
+                    "{stall:?} stall shortened a cooldown: {press_targets:?}"
+                );
+            }
         }
     }
 
