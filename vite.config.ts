@@ -10,5 +10,8 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     setupFiles: "./src/test/setup.ts",
+    // Git worktrees carry their own copy of the tree and of node_modules, so
+    // they would otherwise be collected twice and against the wrong React.
+    exclude: ["**/node_modules/**", "**/dist/**", "**/.worktrees/**"],
   },
 });

@@ -45,6 +45,9 @@ describe("AQlicker desktop API", () => {
     expect(mocks.invoke).toHaveBeenLastCalledWith("set_shortcut", {
       shortcut: "CommandOrControl+Alt+P",
     });
+
+    await aqlickerApi.listApps();
+    expect(mocks.invoke).toHaveBeenLastCalledWith("list_apps");
   });
 
   it("maps typed run events and returns the Tauri unsubscribe function", async () => {
@@ -55,6 +58,8 @@ describe("AQlicker desktop API", () => {
       elapsedMs: 10,
       remainingMs: null,
       successfulPresses: 1,
+      paused: false,
+      waitingForApp: null,
       stopReason: null,
       error: null,
     };

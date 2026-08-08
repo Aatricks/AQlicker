@@ -98,6 +98,30 @@ describe("RunControls", () => {
     expect(screen.queryByText(/remaining/)).not.toBeInTheDocument();
   });
 
+  it("says which application a paused run is waiting for", () => {
+    render(
+      <RunControls
+        blockers={[]}
+        onStart={vi.fn()}
+        onStop={vi.fn()}
+        snapshot={snapshot({
+          status: "running",
+          mode: "timer",
+          paused: true,
+          waitingForApp: "TextEdit",
+          elapsedMs: 5_000,
+          successfulPresses: 7,
+        })}
+        stopPending={false}
+      />,
+    );
+
+    expect(screen.getByText("Paused — waiting for TextEdit")).toBeVisible();
+    // Elapsed time keeps counting while paused, and Stop stays available.
+    expect(screen.getByText("0:05 elapsed")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
+  });
+
   it("disables Stop while a stop is pending or already stopping", () => {
     const onStop = vi.fn();
     const { rerender } = render(

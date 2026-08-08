@@ -101,11 +101,24 @@ pub fn migrate_to_current(document: Value) -> Result<AppConfig, ConfigRepository
         .and_then(Value::as_u64)
         .ok_or(ConfigRepositoryError::UnsupportedSchema)?;
 
-    match schema_version {
-        version if version == u64::from(CURRENT_SCHEMA_VERSION) => {
-            serde_json::from_value(document).map_err(|_| ConfigRepositoryError::InvalidConfig)
-        }
-        _ => Err(ConfigRepositoryError::UnsupportedSchema),
+    let mut document = document;
+    // Migrations are sequential: each arm upgrades one version and falls through
+    // to the next. v1 knew nothing about a target application, so it migrates to
+    // v2 with the restriction switched off.
+    if schema_version == 1 {
+        document["schemaVersion"] = Value::from(2);
+        document["targetApp"] = Value::Null;
+    }
+
+    let schema_version = document
+        .get("schemaVersion")
+        .and_then(Value::as_u64)
+        .ok_or(ConfigRepositoryError::UnsupportedSchema)?;
+
+    if schema_version == u64::from(CURRENT_SCHEMA_VERSION) {
+        serde_json::from_value(document).map_err(|_| ConfigRepositoryError::InvalidConfig)
+    } else {
+        Err(ConfigRepositoryError::UnsupportedSchema)
     }
 }
 
@@ -186,10 +199,25 @@ mod tests {
     }
 
     #[test]
+    fn migration_loads_a_v1_file_with_the_target_application_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILE_NAME);
+        fs::write(&path, include_str!("../tests/fixtures/config-v1.json")).unwrap();
+
+        let loaded = ConfigRepository::new(directory.path()).load().unwrap();
+
+        assert!(loaded.notice.is_none());
+        assert_eq!(loaded.config.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(loaded.config.target_app, None);
+        assert_eq!(loaded.config.natural.naturalness, 65);
+        assert_eq!(loaded.config.stop_after, Some(3_600));
+    }
+
+    #[test]
     fn persistence_rejects_future_schema_without_replacing_the_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(CONFIG_FILE_NAME);
-        fs::write(&path, r#"{"schemaVersion":2}"#).unwrap();
+        fs::write(&path, r#"{"schemaVersion":3}"#).unwrap();
 
         let error = ConfigRepository::new(directory.path()).load().unwrap_err();
 

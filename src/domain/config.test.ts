@@ -1,4 +1,5 @@
-import fixture from "../../src-tauri/tests/fixtures/config-v1.json";
+import fixtureV1 from "../../src-tauri/tests/fixtures/config-v1.json";
+import fixture from "../../src-tauri/tests/fixtures/config-v2.json";
 import logicalKeys from "../../src-tauri/tests/fixtures/logical-keys.json";
 import { describe, expect, it } from "vitest";
 import {
@@ -17,11 +18,16 @@ describe("configuration contract", () => {
     expect(LOGICAL_KEYS).toEqual(logicalKeys);
   });
 
-  it("deserializes the v1 fixture with its exact camelCase schema", () => {
+  it("keeps the v1 fixture readable as the pre-target-application schema", () => {
+    expect(fixtureV1.schemaVersion).toBe(1);
+    expect(fixtureV1).not.toHaveProperty("targetApp");
+  });
+
+  it("deserializes the v2 fixture with its exact camelCase schema", () => {
     const config = fixture as AppConfig;
 
     expect(config).toEqual({
-      schemaVersion: 1,
+      schemaVersion: 2,
       keys: [
         { key: "KeyA", weight: 3 },
         { key: "Digit1", weight: 2 },
@@ -43,6 +49,7 @@ describe("configuration contract", () => {
       },
       stopAfter: 3600,
       globalShortcut: "CommandOrControl+Shift+K",
+      targetApp: { id: "com.apple.TextEdit", name: "TextEdit" },
     });
     expect(serializeConfig(config)).toBe(JSON.stringify(fixture));
   });
@@ -77,6 +84,13 @@ describe("configuration contract", () => {
       { field: "stopAfter", code: "range" },
     ]));
     expect(validateConfigForStart(DEFAULT_CONFIG)).toContainEqual({ field: "keys", code: "required" });
+  });
+
+  it("rejects a target application without a stable identifier", () => {
+    expect(validateConfig({ ...DEFAULT_CONFIG, targetApp: { id: " ", name: "Ghost" } }))
+      .toContainEqual({ field: "targetApp.id", code: "required" });
+    expect(validateConfig({ ...DEFAULT_CONFIG, targetApp: { id: "com.apple.TextEdit", name: "TextEdit" } }))
+      .toEqual([]);
   });
 
   it("caps advanced pause chance at twenty-five percent", () => {

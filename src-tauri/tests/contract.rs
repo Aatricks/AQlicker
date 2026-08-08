@@ -1,4 +1,6 @@
-use aqlicker_lib::{AppConfig, ConfigRepository, KeyEntry, LogicalKey};
+use aqlicker_lib::{
+    AppConfig, ConfigRepository, KeyEntry, LogicalKey, TargetApp, migrate_to_current,
+};
 use std::collections::HashSet;
 
 #[test]
@@ -17,11 +19,11 @@ fn supported_key_catalog_matches_the_exhaustive_golden_list() {
 }
 
 #[test]
-fn contract_deserializes_the_v1_fixture_with_camel_case_fields() {
-    let fixture = include_str!("fixtures/config-v1.json");
+fn contract_deserializes_the_v2_fixture_with_camel_case_fields() {
+    let fixture = include_str!("fixtures/config-v2.json");
     let config: AppConfig = serde_json::from_str(fixture).unwrap();
 
-    assert_eq!(config.schema_version, 1);
+    assert_eq!(config.schema_version, 2);
     assert_eq!(
         config.keys,
         vec![
@@ -55,7 +57,25 @@ fn contract_deserializes_the_v1_fixture_with_camel_case_fields() {
     assert_eq!(config.natural.naturalness, 65);
     assert_eq!(config.stop_after, Some(3_600));
     assert_eq!(config.global_shortcut, "CommandOrControl+Shift+K");
+    assert_eq!(
+        config.target_app,
+        Some(TargetApp {
+            id: "com.apple.TextEdit".to_owned(),
+            name: "TextEdit".to_owned(),
+        })
+    );
     assert_eq!(serde_json::to_string(&config).unwrap(), fixture.trim());
+}
+
+#[test]
+fn contract_migrates_the_v1_fixture_to_the_current_schema_without_a_target() {
+    let document = serde_json::from_str(include_str!("fixtures/config-v1.json")).unwrap();
+
+    let config = migrate_to_current(document).unwrap();
+
+    assert_eq!(config.schema_version, 2);
+    assert_eq!(config.target_app, None);
+    assert!(config.validate().is_empty());
 }
 
 #[test]
@@ -102,7 +122,7 @@ fn corrupt_json_is_preserved_before_defaults_are_loaded() {
 fn load_discards_unrecognized_run_state() {
     let dir = tempfile::tempdir().unwrap();
     let with_run_state = r#"{
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "keys": [],
         "mode": "timer",
         "timer": { "intervalMs": 100 },

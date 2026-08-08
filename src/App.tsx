@@ -11,6 +11,7 @@ import { PermissionBanner } from "./components/PermissionBanner";
 import { RunControls } from "./components/RunControls";
 import { ShortcutRecorder } from "./components/ShortcutRecorder";
 import { StopAfterControls } from "./components/StopAfterControls";
+import { TargetAppPicker } from "./components/TargetAppPicker";
 import { useConfig } from "./hooks/useConfig";
 import { useRunState } from "./hooks/useRunState";
 
@@ -96,12 +97,16 @@ function App({ api = aqlickerApi }: AppProps) {
     [registerShortcut],
   );
 
+  const listApps = useCallback(() => api.listApps(), [api]);
+
   const locked =
     run.snapshot.status === "running" || run.snapshot.status === "stopping";
   const headerStatus = locked
-    ? `${run.snapshot.status === "stopping" ? "Stopping" : "Running"} · ${
-        run.snapshot.mode === "natural" ? "Natural" : "Timer"
-      }`
+    ? run.snapshot.paused
+      ? `Paused · waiting for ${run.snapshot.waitingForApp ?? "target"}`
+      : `${run.snapshot.status === "stopping" ? "Stopping" : "Running"} · ${
+          run.snapshot.mode === "natural" ? "Natural" : "Timer"
+        }`
     : loading
       ? "Loading"
       : loadError
@@ -178,6 +183,14 @@ function App({ api = aqlickerApi }: AppProps) {
               disabled={locked}
               errors={errors}
               onChange={updateConfig}
+            />
+            <TargetAppPicker
+              disabled={locked}
+              listApps={listApps}
+              onChange={(targetApp) =>
+                updateConfig((current) => ({ ...current, targetApp }))
+              }
+              value={config.targetApp}
             />
             <StopAfterControls
               disabled={locked}

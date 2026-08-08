@@ -41,6 +41,7 @@ function fakeApi(overrides: Partial<BootstrapPayload> = {}) {
       async (): Promise<PermissionStatus> => payload.permission,
     ),
     setShortcut: vi.fn(async (shortcut: string) => shortcut),
+    listApps: vi.fn(async () => [{ id: "com.apple.TextEdit", name: "TextEdit" }]),
     listenRunState: vi.fn(async (handler: (state: RunSnapshot) => void) => {
       handlers.push(handler);
       return unlisten;
@@ -74,6 +75,27 @@ function runningState(overrides: Partial<RunSnapshot> = {}): RunSnapshot {
 }
 
 describe("App", () => {
+  it("shows the paused target application in the header and keeps Stop available", async () => {
+    const { api, emit } = fakeApi();
+    render(<App api={api} />);
+    await screen.findByRole("heading", { name: "AQlicker" });
+
+    emit(
+      runningState({
+        elapsedMs: 4_000,
+        successfulPresses: 3,
+        paused: true,
+        waitingForApp: "TextEdit",
+      }),
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Paused · waiting for TextEdit",
+    );
+    expect(screen.getByText("Paused — waiting for TextEdit")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
+  });
+
   it("renders the idle AQlicker shell and required-key validation", async () => {
     render(<App api={fakeApi().api} />);
 

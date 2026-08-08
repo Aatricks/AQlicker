@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::key::LogicalKey;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 const MIN_INTERVAL_MS: u32 = 40;
 const MAX_TIMER_INTERVAL_MS: u32 = 60_000;
 const MAX_NATURAL_INTERVAL_MS: u32 = 5_000;
@@ -20,6 +20,9 @@ pub struct AppConfig {
     pub natural: NaturalConfig,
     pub stop_after: Option<u32>,
     pub global_shortcut: String,
+    /// Optional application the run is restricted to. `None` keeps the run
+    /// unrestricted, which is the behaviour every schema-v1 file migrates to.
+    pub target_app: Option<TargetApp>,
 }
 
 impl Default for AppConfig {
@@ -35,6 +38,7 @@ impl Default for AppConfig {
             },
             stop_after: None,
             global_shortcut: "CommandOrControl+Shift+K".to_owned(),
+            target_app: None,
         }
     }
 }
@@ -110,6 +114,14 @@ impl AppConfig {
             errors.push(ValidationError::new("stopAfter", "range"));
         }
 
+        if self
+            .target_app
+            .as_ref()
+            .is_some_and(|target| target.id.trim().is_empty())
+        {
+            errors.push(ValidationError::new("targetApp.id", "required"));
+        }
+
         errors
     }
 
@@ -121,6 +133,15 @@ impl AppConfig {
         }
         errors
     }
+}
+
+/// A user-visible application, identified by the stable platform identifier
+/// (bundle identifier on macOS, executable name on Windows) and shown by name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetApp {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -7,6 +7,7 @@ use tauri::Manager;
 
 pub mod commands;
 pub mod config;
+pub mod focus;
 pub mod input;
 pub mod key;
 pub mod permission;
@@ -20,9 +21,10 @@ pub use commands::{
     ShortcutRegistrationStatus,
 };
 pub use config::{
-    AppConfig, CURRENT_SCHEMA_VERSION, KeyEntry, Mode, NaturalConfig, NaturalOverrides,
+    AppConfig, CURRENT_SCHEMA_VERSION, KeyEntry, Mode, NaturalConfig, NaturalOverrides, TargetApp,
     TimerConfig, ValidationError,
 };
+pub use focus::{FocusProbe, RunningApp};
 pub use input::{EnigoInputSink, InputFailure, InputSink};
 pub use key::LogicalKey;
 pub use permission::{PermissionProvider, PermissionStatus};
@@ -71,6 +73,7 @@ pub fn run() {
             commands::request_access,
             commands::permission_status,
             commands::set_shortcut,
+            commands::list_apps,
         ])
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

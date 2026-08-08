@@ -14,10 +14,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 
 use crate::{
-    AppConfig, LogicalKey, Mode,
+    AppConfig, LogicalKey, Mode, TargetApp,
+    focus::{FocusProbe, UnknownFocus, system_focus_probe},
     input::{EnigoInputSink, InputFailure, InputSink},
     scheduler::{
-        NaturalSchedule, NaturalSettings, PressSchedule, TimerSchedule, is_before_deadline,
+        NaturalSchedule, NaturalSettings, PressPlan, PressSchedule, TimerSchedule,
+        is_before_deadline,
     },
 };
 
@@ -55,6 +57,12 @@ pub struct RunSnapshot {
     pub elapsed_ms: u64,
     pub remaining_ms: Option<u64>,
     pub successful_presses: u64,
+    /// A restricted run stays `Running` while its target application is not
+    /// frontmost: it emits nothing, holds no key, and keeps counting elapsed
+    /// time toward the automatic-stop duration.
+    pub paused: bool,
+    /// Display name of the application a paused run is waiting for.
+    pub waiting_for_app: Option<String>,
     pub stop_reason: Option<StopReason>,
     pub error: Option<RunError>,
 }
@@ -67,6 +75,8 @@ impl RunSnapshot {
             elapsed_ms: 0,
             remaining_ms: None,
             successful_presses: 0,
+            paused: false,
+            waiting_for_app: None,
             stop_reason: None,
             error: None,
         }
@@ -157,6 +167,7 @@ impl Clock for RealClock {
 
 pub struct RunController {
     sink: Arc<Mutex<Box<dyn InputSink>>>,
+    focus: Arc<Mutex<Box<dyn FocusProbe>>>,
     clock_factory: Arc<dyn Fn(Instant) -> Arc<dyn Clock> + Send + Sync>,
     shared: Arc<SharedState>,
     control: Mutex<Option<Sender<Control>>>,
@@ -202,12 +213,17 @@ impl WorkerPublishGate {
 
 impl RunController {
     pub fn new() -> Result<Self, InputFailure> {
-        Ok(Self::with_sink(Box::new(EnigoInputSink::new()?)))
+        let mut controller = Self::with_sink(Box::new(EnigoInputSink::new()?));
+        controller.set_focus_probe(system_focus_probe());
+        Ok(controller)
     }
 
+    /// Defaults to [`UnknownFocus`] so no test and no unrestricted run ever
+    /// reaches the operating system for the frontmost application.
     pub fn with_sink(sink: Box<dyn InputSink>) -> Self {
         Self {
             sink: Arc::new(Mutex::new(sink)),
+            focus: Arc::new(Mutex::new(Box::new(UnknownFocus))),
             clock_factory: Arc::new(|started| Arc::new(RealClock::new(started))),
             shared: Arc::new(SharedState {
                 state: Mutex::new(RuntimeState {
@@ -230,6 +246,10 @@ impl RunController {
             #[cfg(test)]
             before_worker_exit: None,
         }
+    }
+
+    pub fn set_focus_probe(&mut self, probe: Box<dyn FocusProbe>) {
+        *lock(&self.focus) = probe;
     }
 
     pub fn set_observer(&mut self, observer: RunObserver) {
@@ -297,7 +317,9 @@ impl RunController {
                 NaturalSettings::from_config(&request.natural),
             )),
         };
+        let target = request.target_app.clone();
         let sink = Arc::clone(&self.sink);
+        let focus = Arc::clone(&self.focus);
         let shared = Arc::clone(&self.shared);
         #[cfg(test)]
         let before_worker_exit = self.before_worker_exit.clone();
@@ -327,6 +349,8 @@ impl RunController {
             elapsed_ms: 0,
             remaining_ms: deadline.map(duration_millis),
             successful_presses: 0,
+            paused: false,
+            waiting_for_app: None,
             stop_reason: None,
             error: None,
         };
@@ -341,7 +365,9 @@ impl RunController {
             .name("aqlicker-input-run".to_owned())
             .spawn(move || {
                 if launch_receiver.recv().is_ok() {
-                    worker_main(sink, shared, receiver, schedule, deadline, clock);
+                    worker_main(
+                        sink, focus, target, shared, receiver, schedule, deadline, clock,
+                    );
                     #[cfg(test)]
                     if let Some(gate) = before_worker_exit {
                         gate.pause_once();
@@ -531,8 +557,11 @@ struct PressState {
     failure_phase: FailurePhase,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker_main(
     sink: Arc<Mutex<Box<dyn InputSink>>>,
+    focus: Arc<Mutex<Box<dyn FocusProbe>>>,
+    target: Option<TargetApp>,
     shared: Arc<SharedState>,
     receiver: Receiver<Control>,
     mut schedule: Box<dyn PressSchedule>,
@@ -546,6 +575,8 @@ fn worker_main(
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         execute_schedule(
             &sink,
+            &focus,
+            target.as_ref(),
             &shared,
             &receiver,
             schedule.as_mut(),
@@ -595,8 +626,11 @@ fn worker_main(
     finish(&shared, exit, clock.elapsed());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_schedule(
     sink: &Arc<Mutex<Box<dyn InputSink>>>,
+    focus: &Arc<Mutex<Box<dyn FocusProbe>>>,
+    target: Option<&TargetApp>,
     shared: &Arc<SharedState>,
     receiver: &Receiver<Control>,
     schedule: &mut dyn PressSchedule,
@@ -604,9 +638,17 @@ fn execute_schedule(
     clock: &dyn Clock,
     press_state: &mut PressState,
 ) -> WorkerExit {
+    // Time spent paused. Adding it to every planned offset resumes the schedule
+    // from the actual emission time instead of replaying the presses the run
+    // slept through as a catch-up burst.
+    let mut paused_for = Duration::ZERO;
     loop {
         press_state.failure_phase = FailurePhase::Runtime;
         let plan = schedule.next_press();
+        let plan = PressPlan {
+            target_offset: plan.target_offset.saturating_add(paused_for),
+            ..plan
+        };
         if !is_before_deadline(&plan, deadline) {
             if deadline.is_some_and(|deadline| clock.wait_until(deadline, receiver)) {
                 return WorkerExit::Idle(StopReason::Requested);
@@ -624,6 +666,15 @@ fn execute_schedule(
         }
         if deadline.is_some_and(|deadline| clock.elapsed() >= deadline) {
             return WorkerExit::Idle(StopReason::DurationComplete);
+        }
+        if let Some(target) = target {
+            match await_target(shared, receiver, clock, focus, target, deadline) {
+                Pause::Cancelled => return WorkerExit::Idle(StopReason::Requested),
+                Pause::DeadlineReached => {
+                    return WorkerExit::Idle(StopReason::DurationComplete);
+                }
+                Pause::Ready(waited) => paused_for = paused_for.saturating_add(waited),
+            }
         }
 
         if let Err(failure) = lock(sink).key_down(plan.key) {
@@ -648,6 +699,65 @@ fn execute_schedule(
     }
 }
 
+enum Pause {
+    /// The target application is frontmost again after this much waiting.
+    Ready(Duration),
+    Cancelled,
+    DeadlineReached,
+}
+
+/// How long a paused run sleeps between frontmost-application checks. Stop,
+/// Escape and the global toggle still arrive on the control channel, so they
+/// interrupt the sleep instead of waiting it out.
+const PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Holds the run between presses while `target` is not the frontmost
+/// application. The run stays `Running` and its elapsed time keeps counting, so
+/// the automatic-stop deadline still applies while paused.
+fn await_target(
+    shared: &Arc<SharedState>,
+    receiver: &Receiver<Control>,
+    clock: &dyn Clock,
+    focus: &Arc<Mutex<Box<dyn FocusProbe>>>,
+    target: &TargetApp,
+    deadline: Option<Duration>,
+) -> Pause {
+    let entered = clock.elapsed();
+    let mut published = false;
+    loop {
+        if lock(focus).frontmost().as_deref() == Some(target.id.as_str()) {
+            if published {
+                publish_pause(shared, clock, None);
+            }
+            return Pause::Ready(clock.elapsed().saturating_sub(entered));
+        }
+        if !published {
+            published = true;
+            publish_pause(shared, clock, Some(target.name.clone()));
+        }
+        if deadline.is_some_and(|deadline| clock.elapsed() >= deadline) {
+            return Pause::DeadlineReached;
+        }
+        if clock.wait_until(
+            clock.elapsed().saturating_add(PAUSE_POLL_INTERVAL),
+            receiver,
+        ) {
+            return Pause::Cancelled;
+        }
+    }
+}
+
+/// Publishes only the pause transitions, never every poll tick.
+fn publish_pause(shared: &Arc<SharedState>, clock: &dyn Clock, waiting_for_app: Option<String>) {
+    let mut state = lock(&shared.state);
+    state.snapshot.paused = waiting_for_app.is_some();
+    state.snapshot.waiting_for_app = waiting_for_app;
+    state.snapshot.elapsed_ms = duration_millis(clock.elapsed());
+    let event = next_event(&mut state);
+    drop(state);
+    observe(shared, event);
+}
+
 fn input_failure(key: LogicalKey, failure: InputFailure, phase: FailurePhase) -> WorkerExit {
     WorkerExit::Failed {
         error: RunError {
@@ -662,6 +772,8 @@ fn input_failure(key: LogicalKey, failure: InputFailure, phase: FailurePhase) ->
 
 fn finish(shared: &SharedState, exit: WorkerExit, elapsed: Duration) {
     let mut state = lock(&shared.state);
+    state.snapshot.paused = false;
+    state.snapshot.waiting_for_app = None;
     state.snapshot.elapsed_ms = duration_millis(elapsed);
     state.snapshot.remaining_ms = state
         .deadline
@@ -734,7 +846,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{AppConfig, KeyEntry, LogicalKey, Mode};
+    use crate::{AppConfig, KeyEntry, LogicalKey, Mode, TargetApp};
 
     #[derive(Clone)]
     struct BlockingSink {
@@ -1715,6 +1827,269 @@ mod tests {
         dropper.join().unwrap();
 
         assert_eq!(*events.lock().unwrap(), vec!["down:KeyA", "up:KeyA"]);
+    }
+
+    /// Scripted stand-in for the platform lookup. `frontmost` walks the script
+    /// and repeats its last entry, so a test decides exactly when focus returns.
+    #[derive(Clone)]
+    struct FakeFocus {
+        script: Arc<Mutex<Vec<Option<&'static str>>>>,
+        calls: Arc<Mutex<usize>>,
+        asked: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl FakeFocus {
+        fn new(script: &[Option<&'static str>]) -> Self {
+            Self {
+                script: Arc::new(Mutex::new(script.to_vec())),
+                calls: Arc::new(Mutex::new(0)),
+                asked: Arc::new((Mutex::new(false), Condvar::new())),
+            }
+        }
+
+        fn always(app: Option<&'static str>) -> Self {
+            Self::new(&[app])
+        }
+
+        fn calls(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl crate::focus::FocusProbe for FakeFocus {
+        fn frontmost(&mut self) -> Option<String> {
+            signal(&self.asked);
+            let script = self.script.lock().unwrap();
+            let mut calls = self.calls.lock().unwrap();
+            let index = (*calls).min(script.len() - 1);
+            *calls += 1;
+            script[index].map(str::to_owned)
+        }
+
+        fn running_apps(&mut self) -> Vec<crate::focus::RunningApp> {
+            Vec::new()
+        }
+    }
+
+    fn targeted_request(mode: Mode) -> AppConfig {
+        AppConfig {
+            target_app: Some(TargetApp {
+                id: "com.apple.TextEdit".to_owned(),
+                name: "TextEdit".to_owned(),
+            }),
+            ..test_request(mode)
+        }
+    }
+
+    fn controller_with_focus<C: Clock + 'static>(
+        sink: Box<dyn InputSink>,
+        clock: Arc<C>,
+        focus: FakeFocus,
+    ) -> RunController {
+        let mut controller = RunController::for_test_with_clock(sink, clock);
+        controller.set_focus_probe(Box::new(focus));
+        controller
+    }
+
+    #[test]
+    fn an_unrestricted_run_never_asks_which_application_is_frontmost() {
+        let focus = FakeFocus::always(Some("com.apple.TextEdit"));
+        let controller = controller_with_focus(
+            Box::new(TimedRecordingSink {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(VirtualClock::new()),
+            focus.clone(),
+        );
+
+        controller.start(test_request(Mode::Timer)).unwrap();
+        controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(focus.calls(), 0);
+    }
+
+    #[test]
+    fn a_restricted_run_pauses_until_the_target_application_is_frontmost() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = controller_with_focus(
+            Box::new(TimedRecordingSink {
+                events: Arc::clone(&events),
+            }),
+            Arc::new(VirtualClock::new()),
+            FakeFocus::new(&[
+                Some("com.apple.Safari"),
+                Some("com.apple.Safari"),
+                Some("com.apple.TextEdit"),
+            ]),
+        );
+        let captured = Arc::clone(&observed);
+        controller.set_observer(Arc::new(move |snapshot| {
+            captured.lock().unwrap().push(snapshot);
+        }));
+
+        controller.start(targeted_request(Mode::Timer)).unwrap();
+        controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        let observed = observed.lock().unwrap();
+        let paused = observed
+            .iter()
+            .position(|snapshot| snapshot.paused)
+            .expect("a paused snapshot must be published");
+        assert_eq!(
+            observed[paused].waiting_for_app.as_deref(),
+            Some("TextEdit")
+        );
+        assert_eq!(observed[paused].status, RunStatus::Running);
+        assert_eq!(observed[paused].successful_presses, 0);
+        assert!(
+            observed[paused + 1..]
+                .iter()
+                .any(|snapshot| !snapshot.paused && snapshot.successful_presses > 0),
+            "the run must resume and press once focus returns"
+        );
+        assert!(!observed.last().unwrap().paused);
+        assert!(!events.lock().unwrap().is_empty());
+    }
+
+    /// The pause gate sits between key-up and the next key-down, so losing focus
+    /// mid-press can never leave a key held. The sink drops focus from inside
+    /// `key_down` to force exactly that ordering.
+    #[test]
+    fn a_pause_never_leaves_a_key_held_down() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let focus = FakeFocus::new(&[Some("com.apple.TextEdit"), Some("com.apple.Safari")]);
+        let mut controller = controller_with_focus(
+            Box::new(FocusLosingSink {
+                events: Arc::clone(&events),
+                focus: focus.clone(),
+            }),
+            Arc::new(VirtualClock::new()),
+            focus,
+        );
+        let captured = Arc::clone(&observed);
+        controller.set_observer(Arc::new(move |snapshot| {
+            captured
+                .lock()
+                .unwrap()
+                .push((snapshot.paused, snapshot.successful_presses));
+        }));
+
+        controller.start(targeted_request(Mode::Timer)).unwrap();
+        controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(*events, vec!["down:KeyA", "up:KeyA"]);
+        let observed = observed.lock().unwrap();
+        assert!(
+            observed
+                .iter()
+                .any(|&(paused, presses)| paused && presses == 1),
+            "the pause must be published after the press completed: {observed:?}"
+        );
+    }
+
+    /// A resumed run must not replay the presses it slept through. The virtual
+    /// clock only moves when the worker waits, so the press count is exactly the
+    /// number of intervals left between the resume and the deadline.
+    #[test]
+    fn a_resumed_run_does_not_replay_the_presses_it_paused_through() {
+        let controller = controller_with_focus(
+            Box::new(TimedRecordingSink {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(VirtualClock::new()),
+            FakeFocus::new(&[
+                Some("com.apple.Safari"),
+                Some("com.apple.Safari"),
+                Some("com.apple.Safari"),
+                Some("com.apple.TextEdit"),
+            ]),
+        );
+
+        // 200 ms poll x 3 = 600 ms paused, then a 100 ms timer interval until
+        // the 1 s automatic stop.
+        let snapshot = {
+            controller.start(targeted_request(Mode::Timer)).unwrap();
+            controller
+                .wait_for_terminal(Duration::from_secs(1))
+                .unwrap()
+        };
+
+        assert_eq!(snapshot.successful_presses, 4);
+        assert_eq!(snapshot.stop_reason, Some(StopReason::DurationComplete));
+    }
+
+    #[test]
+    fn a_paused_run_stops_without_waiting_out_the_poll_interval() {
+        let focus = FakeFocus::always(Some("com.apple.Safari"));
+        let asked = Arc::clone(&focus.asked);
+        let controller = controller_with_focus(
+            Box::new(TimedRecordingSink {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(RealClock::new(Instant::now())),
+            focus,
+        );
+
+        controller.start(targeted_request(Mode::Timer)).unwrap();
+        wait_until_true(&asked);
+        assert!(controller.stop());
+        let snapshot = controller
+            .wait_for_terminal(Duration::from_millis(200))
+            .unwrap();
+
+        assert_eq!(snapshot.status, RunStatus::Idle);
+        assert_eq!(snapshot.stop_reason, Some(StopReason::Requested));
+        assert_eq!(snapshot.successful_presses, 0);
+        assert!(!snapshot.paused);
+    }
+
+    #[test]
+    fn a_paused_run_still_completes_its_automatic_stop_duration() {
+        let controller = controller_with_focus(
+            Box::new(TimedRecordingSink {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(VirtualClock::new()),
+            FakeFocus::always(Some("com.apple.Safari")),
+        );
+
+        controller.start(targeted_request(Mode::Timer)).unwrap();
+        let snapshot = controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(snapshot.stop_reason, Some(StopReason::DurationComplete));
+        assert_eq!(snapshot.successful_presses, 0);
+        assert!(!snapshot.paused);
+        assert_eq!(snapshot.waiting_for_app, None);
+    }
+
+    struct FocusLosingSink {
+        events: Arc<Mutex<Vec<String>>>,
+        focus: FakeFocus,
+    }
+
+    impl InputSink for FocusLosingSink {
+        fn key_down(&mut self, key: LogicalKey) -> Result<(), InputFailure> {
+            self.events.lock().unwrap().push(format!("down:{key:?}"));
+            // Focus leaves while the key is physically down.
+            *self.focus.calls.lock().unwrap() = 1;
+            Ok(())
+        }
+
+        fn key_up(&mut self, key: LogicalKey) -> Result<(), InputFailure> {
+            self.events.lock().unwrap().push(format!("up:{key:?}"));
+            Ok(())
+        }
     }
 
     fn test_request(mode: Mode) -> AppConfig {

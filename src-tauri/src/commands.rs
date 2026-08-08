@@ -13,6 +13,7 @@ use tauri::{Emitter, Manager};
 use crate::{
     AppConfig, ConfigRepository, ConfigRepositoryError, RecoveryNotice, RunController, RunError,
     RunSnapshot, RunStatus, StartOutcome,
+    focus::{RunningApp, system_focus_probe},
     permission::{PermissionProvider, PermissionStatus},
     shortcuts::{ShortcutAction, ShortcutController, ShortcutError},
 };
@@ -782,6 +783,16 @@ pub async fn request_access(app: tauri::AppHandle) -> Result<PermissionStatus, C
 #[tauri::command]
 pub async fn permission_status(app: tauri::AppHandle) -> Result<PermissionStatus, CommandError> {
     on_service(app, AppService::permission_status).await
+}
+
+/// Lists the user-visible applications a run can be restricted to. It touches
+/// no shared state, so it skips the service dispatcher entirely and only has to
+/// stay off the main thread like every other command.
+#[tauri::command]
+pub async fn list_apps() -> Result<Vec<RunningApp>, CommandError> {
+    tauri::async_runtime::spawn_blocking(|| system_focus_probe().running_apps())
+        .await
+        .map_err(|_| CommandError::new("apps-unavailable"))
 }
 
 #[tauri::command]

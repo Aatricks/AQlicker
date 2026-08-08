@@ -34,7 +34,9 @@ export function RunControls({
   const active = snapshot.status === "running" || snapshot.status === "stopping";
   const mode = snapshot.mode ? MODE_LABELS[snapshot.mode] : "Run";
   const headline = active
-    ? `${mode} mode ${snapshot.status}`
+    ? snapshot.paused
+      ? `Paused — waiting for ${snapshot.waitingForApp ?? "the target application"}`
+      : `${mode} mode ${snapshot.status}`
     : snapshot.status === "failed"
       ? "Run stopped"
       : "Idle";

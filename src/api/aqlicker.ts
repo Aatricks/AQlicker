@@ -23,8 +23,16 @@ export interface RunSnapshot {
   elapsedMs: number;
   remainingMs: number | null;
   successfulPresses: number;
+  /** A restricted run stays `running` while its target application is away. */
+  paused: boolean;
+  waitingForApp: string | null;
   stopReason: StopReason | null;
   error: RunError | null;
+}
+
+export interface RunningApp {
+  id: string;
+  name: string;
 }
 
 export interface PermissionStatus {
@@ -54,6 +62,7 @@ export interface AqlickerApi {
   requestAccess(): Promise<PermissionStatus>;
   permissionStatus(): Promise<PermissionStatus>;
   setShortcut(shortcut: string): Promise<string>;
+  listApps(): Promise<RunningApp[]>;
   listenRunState(handler: (state: RunSnapshot) => void): Promise<() => void>;
 }
 
@@ -65,6 +74,7 @@ export const aqlickerApi: AqlickerApi = {
   requestAccess: () => invoke<PermissionStatus>("request_access"),
   permissionStatus: () => invoke<PermissionStatus>("permission_status"),
   setShortcut: (shortcut) => invoke<string>("set_shortcut", { shortcut }),
+  listApps: () => invoke<RunningApp[]>("list_apps"),
   listenRunState: (handler) =>
     listen<RunSnapshot>(RUN_STATE_EVENT, (event) => handler(event.payload)),
 };

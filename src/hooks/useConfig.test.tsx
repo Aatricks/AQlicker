@@ -23,6 +23,8 @@ function bootstrap(): BootstrapPayload {
       elapsedMs: 0,
       remainingMs: null,
       successfulPresses: 0,
+      paused: false,
+      waitingForApp: null,
       stopReason: null,
       error: null,
     },

@@ -21,14 +21,21 @@ export interface NaturalOverrides {
   pauseChancePercent: number;
 }
 
+export interface TargetApp {
+  /** Stable platform identifier: bundle id on macOS, executable name on Windows. */
+  id: string;
+  name: string;
+}
+
 export interface AppConfig {
-  schemaVersion: 1;
+  schemaVersion: 2;
   keys: Array<{ key: LogicalKey; weight: number }>;
   mode: Mode;
   timer: { intervalMs: number };
   natural: { naturalness: number; advanced: NaturalOverrides | null };
   stopAfter: number | null;
   globalShortcut: string;
+  targetApp: TargetApp | null;
 }
 
 export interface ValidationError {
@@ -37,13 +44,14 @@ export interface ValidationError {
 }
 
 export const DEFAULT_CONFIG: AppConfig = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   keys: [],
   mode: "timer",
   timer: { intervalMs: 100 },
   natural: { naturalness: 50, advanced: null },
   stopAfter: null,
   globalShortcut: "CommandOrControl+Shift+K",
+  targetApp: null,
 };
 
 export function validateConfig(config: AppConfig): ValidationError[] {
@@ -93,6 +101,10 @@ export function validateConfig(config: AppConfig): ValidationError[] {
 
   if (config.stopAfter !== null && (!Number.isInteger(config.stopAfter) || config.stopAfter < 1 || config.stopAfter > 86_400)) {
     errors.push({ field: "stopAfter", code: "range" });
+  }
+
+  if (config.targetApp !== null && config.targetApp.id.trim() === "") {
+    errors.push({ field: "targetApp.id", code: "required" });
   }
 
   return errors;
