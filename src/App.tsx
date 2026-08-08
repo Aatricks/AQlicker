@@ -1,16 +1,31 @@
-import { aqlickerApi, type AqlickerApi } from "./api/aqlicker";
+import { useCallback, useEffect, useState } from "react";
+import {
+  aqlickerApi,
+  type AqlickerApi,
+  type PermissionStatus,
+} from "./api/aqlicker";
+import { ErrorNotice } from "./components/ErrorNotice";
 import { KeySequenceEditor } from "./components/KeySequenceEditor";
 import { ModeControls } from "./components/ModeControls";
+import { PermissionBanner } from "./components/PermissionBanner";
+import { RunControls } from "./components/RunControls";
 import { ShortcutRecorder } from "./components/ShortcutRecorder";
 import { StopAfterControls } from "./components/StopAfterControls";
 import { useConfig } from "./hooks/useConfig";
+import { useRunState } from "./hooks/useRunState";
 
 interface AppProps {
   api?: AqlickerApi;
 }
 
+const UNKNOWN_PERMISSION: PermissionStatus = {
+  granted: false,
+  sameIntegrityOnly: false,
+};
+
 function App({ api = aqlickerApi }: AppProps) {
   const {
+    bootstrap,
     config,
     errors,
     startErrors,
@@ -20,11 +35,81 @@ function App({ api = aqlickerApi }: AppProps) {
     updateConfig,
     registerShortcut,
   } = useConfig(api);
-  const bootstrapStatus = loading
-    ? "Loading"
-    : loadError
-      ? "Unavailable"
-      : "Ready";
+  const run = useRunState(api);
+
+  const [permissionOverride, setPermissionOverride] =
+    useState<PermissionStatus | null>(null);
+  const [shortcutOverride, setShortcutOverride] = useState<boolean | null>(null);
+  const [requesting, setRequesting] = useState(false);
+  const [recoveryDismissed, setRecoveryDismissed] = useState(false);
+
+  const permission =
+    permissionOverride ?? bootstrap?.permission ?? UNKNOWN_PERMISSION;
+  const shortcutRegistered =
+    shortcutOverride ?? bootstrap?.shortcut.registered ?? false;
+
+  useEffect(() => {
+    let active = true;
+    const refresh = () => {
+      void api
+        .permissionStatus()
+        .then((status) => {
+          if (active) setPermissionOverride(status);
+        })
+        .catch(() => undefined);
+    };
+
+    window.addEventListener("focus", refresh);
+    return () => {
+      active = false;
+      window.removeEventListener("focus", refresh);
+    };
+  }, [api]);
+
+  const requestAccess = useCallback(() => {
+    setRequesting(true);
+    void api
+      .requestAccess()
+      .then(setPermissionOverride)
+      .catch(() => undefined)
+      .finally(() => setRequesting(false));
+  }, [api]);
+
+  const recordShortcut = useCallback(
+    async (candidate: string) => {
+      const registered = await registerShortcut(candidate);
+      setShortcutOverride(true);
+      return registered;
+    },
+    [registerShortcut],
+  );
+
+  const locked =
+    run.snapshot.status === "running" || run.snapshot.status === "stopping";
+  const headerStatus = locked
+    ? `${run.snapshot.status === "stopping" ? "Stopping" : "Running"} · ${
+        run.snapshot.mode === "natural" ? "Natural" : "Timer"
+      }`
+    : loading
+      ? "Loading"
+      : loadError
+        ? "Unavailable"
+        : "Ready";
+
+  const blockers = config
+    ? Array.from(
+        new Set([
+          ...Object.values(startErrors),
+          ...(permission.granted ? [] : ["Grant input permission"]),
+          ...(shortcutRegistered ? [] : ["Register the global shortcut"]),
+        ]),
+      )
+    : [loadError ? "Settings could not be loaded" : "Loading settings"];
+
+  const recoveryCode =
+    !recoveryDismissed && bootstrap?.recoveryNotice
+      ? bootstrap.recoveryNotice.code
+      : null;
 
   return (
     <main className="app-background">
@@ -39,7 +124,7 @@ function App({ api = aqlickerApi }: AppProps) {
             role="status"
           >
             <span aria-hidden="true" />
-            {bootstrapStatus}
+            {headerStatus}
           </p>
         </header>
 
@@ -49,9 +134,25 @@ function App({ api = aqlickerApi }: AppProps) {
           </p>
         )}
 
+        {recoveryCode && (
+          <ErrorNotice
+            code={recoveryCode}
+            onDismiss={() => setRecoveryDismissed(true)}
+          />
+        )}
+
+        {bootstrap && (
+          <PermissionBanner
+            onRequestAccess={requestAccess}
+            requesting={requesting}
+            status={permission}
+          />
+        )}
+
         {config && (
           <div className="configuration-stack">
             <KeySequenceEditor
+              disabled={locked}
               error={startErrors.keys}
               errors={errors}
               mode={config.mode}
@@ -62,10 +163,12 @@ function App({ api = aqlickerApi }: AppProps) {
             />
             <ModeControls
               config={config}
+              disabled={locked}
               errors={errors}
               onChange={updateConfig}
             />
             <StopAfterControls
+              disabled={locked}
               error={errors.stopAfter}
               onChange={(stopAfter) =>
                 updateConfig((current) => ({ ...current, stopAfter }))
@@ -73,7 +176,8 @@ function App({ api = aqlickerApi }: AppProps) {
               value={config.stopAfter}
             />
             <ShortcutRecorder
-              onRecord={registerShortcut}
+              disabled={locked}
+              onRecord={recordShortcut}
               value={config.globalShortcut}
             />
           </div>
@@ -85,17 +189,25 @@ function App({ api = aqlickerApi }: AppProps) {
           </p>
         )}
 
-        <footer className="run-footer">
-          <div>
-            <strong>{loadError ? "Unavailable" : "Idle"}</strong>
-            <span>
-              {loadError ? "Settings could not be loaded" : "Configure a run above"}
-            </span>
-          </div>
-          <button className="start-button" type="button" disabled>
-            Start
-          </button>
-        </footer>
+        {run.error && (
+          <ErrorNotice
+            code={run.error.code}
+            detail={run.error.message}
+            failedKey={run.error.key}
+            onDismiss={run.dismissError}
+            sameIntegrityOnly={permission.sameIntegrityOnly}
+          />
+        )}
+
+        <RunControls
+          blockers={blockers}
+          onStart={() => {
+            if (config) void run.start(config);
+          }}
+          onStop={() => void run.stop()}
+          snapshot={run.snapshot}
+          stopPending={run.stopPending}
+        />
       </div>
     </main>
   );

@@ -39,7 +39,7 @@ const PUNCTUATION_LABELS: Partial<Record<LogicalKey, string>> = {
   Slash: "/",
 };
 
-function keyLabel(key: LogicalKey) {
+export function keyLabel(key: LogicalKey) {
   if (key.startsWith("Key")) return key.slice(3);
   if (key.startsWith("Digit")) return key.slice(5);
   if (key.startsWith("Arrow")) return `${key.slice(5)} arrow`;
