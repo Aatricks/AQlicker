@@ -56,14 +56,14 @@ impl From<ShortcutError> for CommandError {
     }
 }
 
-pub type RuntimeObserver = Arc<dyn Fn(u64, RunSnapshot) + Send + Sync>;
+pub type RuntimeObserver = Arc<dyn Fn(u64, u64, RunSnapshot) + Send + Sync>;
 
 pub trait RuntimeService: Send + Sync {
     fn set_observer(&mut self, observer: RuntimeObserver);
     fn start(&self, config: AppConfig) -> Result<Option<u64>, CommandError>;
     fn stop(&self) -> bool;
     fn snapshot(&self) -> RunSnapshot;
-    fn shutdown(&self, timeout: Duration) -> Result<(u64, RunSnapshot), CommandError>;
+    fn shutdown(&self, timeout: Duration) -> Result<(u64, u64, RunSnapshot), CommandError>;
 }
 
 impl RuntimeService for RunController {
@@ -85,9 +85,9 @@ impl RuntimeService for RunController {
         RunController::snapshot(self)
     }
 
-    fn shutdown(&self, timeout: Duration) -> Result<(u64, RunSnapshot), CommandError> {
+    fn shutdown(&self, timeout: Duration) -> Result<(u64, u64, RunSnapshot), CommandError> {
         RunController::shutdown(self, timeout)
-            .map(|snapshot| (self.generation(), snapshot))
+            .map(|snapshot| (self.generation(), self.revision(), snapshot))
             .map_err(|error| CommandError::new(error.code))
     }
 }
@@ -121,7 +121,7 @@ impl Default for DesktopRuntime {
     fn default() -> Self {
         Self {
             controller: Mutex::new(None),
-            observer: Mutex::new(Arc::new(|_, _| {})),
+            observer: Mutex::new(Arc::new(|_, _, _| {})),
         }
     }
 }
@@ -159,13 +159,13 @@ impl RuntimeService for DesktopRuntime {
             .map_or_else(RunSnapshot::idle, RunController::snapshot)
     }
 
-    fn shutdown(&self, timeout: Duration) -> Result<(u64, RunSnapshot), CommandError> {
+    fn shutdown(&self, timeout: Duration) -> Result<(u64, u64, RunSnapshot), CommandError> {
         lock(&self.controller).as_ref().map_or_else(
-            || Ok((0, RunSnapshot::idle())),
+            || Ok((0, 0, RunSnapshot::idle())),
             |controller| {
                 controller
                     .shutdown(timeout)
-                    .map(|snapshot| (controller.generation(), snapshot))
+                    .map(|snapshot| (controller.generation(), controller.revision(), snapshot))
                     .map_err(|error| CommandError::new(error.code))
             },
         )
@@ -176,6 +176,7 @@ pub struct AppService {
     submission: Mutex<SubmissionState>,
     shutdown_ready: Condvar,
     dispatcher: Mutex<Option<JoinHandle<()>>>,
+    ingress: Arc<ServiceIngress>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,10 +189,33 @@ enum ServiceLifecycle {
 
 struct SubmissionState {
     lifecycle: ServiceLifecycle,
-    sender: Sender<ServiceAction>,
+    sender: Option<Sender<ServiceAction>>,
+}
+
+struct ServiceIngress {
+    senders: Mutex<Option<IngressSenders>>,
+}
+
+struct IngressSenders {
+    actions: Sender<ServiceAction>,
+    runtime: Sender<RuntimeEvent>,
+}
+
+impl ServiceIngress {
+    fn publish(&self, generation: u64, revision: u64, snapshot: RunSnapshot) {
+        if let Some(senders) = lock(&self.senders).as_ref() {
+            let _ = senders.runtime.send((generation, revision, snapshot));
+            let _ = senders.actions.send(ServiceAction::RuntimeWake);
+        }
+    }
+
+    fn close(&self) {
+        lock(&self.senders).take();
+    }
 }
 
 type Reply<T> = Sender<Result<T, CommandError>>;
+type RuntimeEvent = (u64, u64, RunSnapshot);
 
 enum ServiceAction {
     Bootstrap(Reply<BootstrapPayload>),
@@ -207,6 +231,15 @@ enum ServiceAction {
     Shutdown(Reply<()>),
 }
 
+impl ServiceAction {
+    fn allowed_while_shutting_down(&self) -> bool {
+        matches!(
+            self,
+            Self::Stop(_) | Self::Shortcut(_, _) | Self::Snapshot(_) | Self::PermissionStatus(_)
+        )
+    }
+}
+
 struct ServiceCore {
     repository: ConfigRepository,
     permission: Box<dyn PermissionProvider>,
@@ -216,7 +249,10 @@ struct ServiceCore {
     current_config: Option<AppConfig>,
     visible_run: RunSnapshot,
     active_generation: Option<u64>,
+    last_event_generation: u64,
+    last_event_revision: u64,
     escape_cleanup_required: bool,
+    shutdown_pending: bool,
 }
 
 impl AppService {
@@ -229,10 +265,17 @@ impl AppService {
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let (runtime_sender, runtime_receiver) = mpsc::channel();
-        let observed_sender = sender.clone();
-        runtime.set_observer(Arc::new(move |generation, snapshot| {
-            let _ = runtime_sender.send((generation, snapshot));
-            let _ = observed_sender.send(ServiceAction::RuntimeWake);
+        let ingress = Arc::new(ServiceIngress {
+            senders: Mutex::new(Some(IngressSenders {
+                actions: sender.clone(),
+                runtime: runtime_sender,
+            })),
+        });
+        let observed_ingress = Arc::downgrade(&ingress);
+        runtime.set_observer(Arc::new(move |generation, revision, snapshot| {
+            if let Some(ingress) = observed_ingress.upgrade() {
+                ingress.publish(generation, revision, snapshot);
+            }
         }));
         let visible_run = runtime.snapshot();
         let core = ServiceCore {
@@ -244,7 +287,10 @@ impl AppService {
             current_config: None,
             visible_run,
             active_generation: None,
+            last_event_generation: 0,
+            last_event_revision: 0,
             escape_cleanup_required: false,
+            shutdown_pending: false,
         };
         let dispatcher = thread::Builder::new()
             .name("aqlicker-service".to_owned())
@@ -253,10 +299,11 @@ impl AppService {
         Self {
             submission: Mutex::new(SubmissionState {
                 lifecycle: ServiceLifecycle::Running,
-                sender,
+                sender: Some(sender),
             }),
             shutdown_ready: Condvar::new(),
             dispatcher: Mutex::new(Some(dispatcher)),
+            ingress,
         }
     }
 
@@ -309,11 +356,18 @@ impl AppService {
 
     fn enqueue(&self, action: ServiceAction) -> Result<(), CommandError> {
         let submission = lock(&self.submission);
-        if submission.lifecycle != ServiceLifecycle::Running {
+        let admitted = submission.lifecycle == ServiceLifecycle::Running
+            || (matches!(
+                submission.lifecycle,
+                ServiceLifecycle::ShuttingDown | ServiceLifecycle::ShutdownFailed
+            ) && action.allowed_while_shutting_down());
+        if !admitted {
             return Err(CommandError::new("service-shutting-down"));
         }
         submission
             .sender
+            .as_ref()
+            .ok_or_else(|| CommandError::new("service-unavailable"))?
             .send(action)
             .map_err(|_| CommandError::new("service-unavailable"))
     }
@@ -343,12 +397,11 @@ impl AppService {
                     ServiceLifecycle::Running | ServiceLifecycle::ShutdownFailed => {
                         let (reply, result) = mpsc::channel();
                         submission.lifecycle = ServiceLifecycle::ShuttingDown;
-                        if submission
-                            .sender
-                            .send(ServiceAction::Shutdown(reply))
-                            .is_err()
-                        {
-                            submission.lifecycle = ServiceLifecycle::Closed;
+                        let sent = submission.sender.as_ref().is_some_and(|sender| {
+                            sender.send(ServiceAction::Shutdown(reply)).is_ok()
+                        });
+                        if !sent {
+                            submission.lifecycle = ServiceLifecycle::ShutdownFailed;
                             self.shutdown_ready.notify_all();
                             return Err(CommandError::new("service-unavailable"));
                         }
@@ -361,6 +414,8 @@ impl AppService {
                 .recv()
                 .unwrap_or_else(|_| Err(CommandError::new("service-unavailable")));
             if shutdown.is_ok() {
+                self.ingress.close();
+                lock(&self.submission).sender.take();
                 if let Some(dispatcher) = lock(&self.dispatcher).take() {
                     let _ = dispatcher.join();
                 }
@@ -379,7 +434,24 @@ impl AppService {
 
 impl Drop for AppService {
     fn drop(&mut self) {
-        let _ = self.shutdown();
+        let already_failed = lock(&self.submission).lifecycle == ServiceLifecycle::ShutdownFailed;
+        if already_failed || self.shutdown().is_err() {
+            {
+                let mut submission = lock(&self.submission);
+                submission.lifecycle = ServiceLifecycle::Closed;
+                submission.sender.take();
+            }
+            self.ingress.close();
+            if let Some(dispatcher) = lock(&self.dispatcher).take() {
+                let deadline = std::time::Instant::now() + Duration::from_millis(100);
+                while !dispatcher.is_finished() && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                if dispatcher.is_finished() {
+                    let _ = dispatcher.join();
+                }
+            }
+        }
     }
 }
 
@@ -442,6 +514,7 @@ impl ServiceCore {
             }
             Ok(None) if !was_active => {
                 self.unregister_escape_or_fail()?;
+                return Err(CommandError::new("run-terminal-pending"));
             }
             Ok(None) => {}
             Err(error) => {
@@ -494,6 +567,9 @@ impl ServiceCore {
     }
 
     fn handle_shortcut(&mut self, action: ShortcutAction) -> Result<RunSnapshot, CommandError> {
+        if self.shutdown_pending {
+            return Ok(self.stop());
+        }
         match action {
             ShortcutAction::StopRun => Ok(self.stop()),
             ShortcutAction::ToggleRun => match self.runtime.snapshot().status {
@@ -507,11 +583,23 @@ impl ServiceCore {
         }
     }
 
-    fn runtime_snapshot(&mut self, generation: u64, snapshot: RunSnapshot) {
+    fn runtime_snapshot(&mut self, generation: u64, revision: u64, snapshot: RunSnapshot) {
+        if generation < self.last_event_generation
+            || (generation == self.last_event_generation && revision <= self.last_event_revision)
+        {
+            return;
+        }
+        self.last_event_generation = generation;
+        self.last_event_revision = revision;
         if self
             .active_generation
             .is_some_and(|active| active != generation)
         {
+            return;
+        }
+        if self.shutdown_pending {
+            self.visible_run = snapshot;
+            self.emitter.emit(&self.visible_run);
             return;
         }
         if matches!(snapshot.status, RunStatus::Idle | RunStatus::Failed)
@@ -564,30 +652,27 @@ impl ServiceCore {
     }
 
     fn shutdown(&mut self) -> Result<(), CommandError> {
-        let runtime_result =
-            self.runtime
-                .shutdown(SHUTDOWN_TIMEOUT)
-                .map(|(generation, snapshot)| {
-                    self.runtime_snapshot(generation, snapshot);
-                });
-        let cleanup_result = if self.escape_cleanup_required {
-            self.unregister_escape_or_fail()
-        } else {
-            Ok(())
-        };
-        let shortcut_result = self.shortcuts.unregister_all().map_err(CommandError::from);
-        runtime_result.and(cleanup_result).and(shortcut_result)
+        self.shutdown_pending = true;
+        let (generation, revision, snapshot) = self.runtime.shutdown(SHUTDOWN_TIMEOUT)?;
+        self.runtime_snapshot(generation, revision, snapshot);
+        self.shortcuts
+            .unregister_all()
+            .map_err(CommandError::from)?;
+        self.active_generation = None;
+        self.escape_cleanup_required = false;
+        self.shutdown_pending = false;
+        Ok(())
     }
 }
 
 fn dispatch_actions(
     receiver: Receiver<ServiceAction>,
-    runtime_receiver: Receiver<(u64, RunSnapshot)>,
+    runtime_receiver: Receiver<RuntimeEvent>,
     mut core: ServiceCore,
 ) {
     while let Ok(action) = receiver.recv() {
-        while let Ok((generation, snapshot)) = runtime_receiver.try_recv() {
-            core.runtime_snapshot(generation, snapshot);
+        while let Ok((generation, revision, snapshot)) = runtime_receiver.try_recv() {
+            core.runtime_snapshot(generation, revision, snapshot);
         }
         match action {
             ServiceAction::Bootstrap(reply) => {
@@ -995,7 +1080,10 @@ mod tests {
                 ..RunSnapshot::idle()
             },
             active_generation: Some(2),
+            last_event_generation: 2,
+            last_event_revision: 1,
             escape_cleanup_required: false,
+            shutdown_pending: false,
         };
         let stale_terminal = RunSnapshot {
             status: RunStatus::Idle,
@@ -1003,11 +1091,86 @@ mod tests {
             ..RunSnapshot::idle()
         };
 
-        core.runtime_snapshot(1, stale_terminal);
+        core.runtime_snapshot(1, 9, stale_terminal);
 
         assert_eq!(core.active_generation, Some(2));
         assert_eq!(core.visible_run.status, RunStatus::Running);
         assert!(escape_registered.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn delayed_stopping_snapshot_cannot_overwrite_same_generation_terminal_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let escape_registered = Arc::new(AtomicBool::new(true));
+        let mut core = ServiceCore {
+            repository: ConfigRepository::new(directory.path()),
+            permission: Box::new(FakePermission { granted: true }),
+            shortcuts: Box::new(FakeShortcuts::with_escape_state(Arc::clone(
+                &escape_registered,
+            ))),
+            runtime: Box::new(FakeRuntime::new(Arc::new(Mutex::new(0)))),
+            emitter: Arc::new(RecordingEmitter::default()),
+            current_config: Some(valid_config()),
+            visible_run: RunSnapshot {
+                status: RunStatus::Running,
+                ..RunSnapshot::idle()
+            },
+            active_generation: Some(7),
+            last_event_generation: 7,
+            last_event_revision: 1,
+            escape_cleanup_required: false,
+            shutdown_pending: false,
+        };
+        let terminal = RunSnapshot {
+            status: RunStatus::Idle,
+            stop_reason: Some(StopReason::DurationComplete),
+            ..RunSnapshot::idle()
+        };
+        let stopping = RunSnapshot {
+            status: RunStatus::Stopping,
+            ..RunSnapshot::idle()
+        };
+
+        core.runtime_snapshot(7, 3, terminal);
+        core.runtime_snapshot(7, 2, stopping);
+
+        assert_eq!(core.visible_run.status, RunStatus::Idle);
+        assert_eq!(
+            core.visible_run.stop_reason,
+            Some(StopReason::DurationComplete)
+        );
+    }
+
+    #[test]
+    fn terminal_snapshot_before_worker_finish_returns_truthful_pending_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let finished = Arc::new(AtomicBool::new(false));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let service = AppService::new(
+            ConfigRepository::new(directory.path()),
+            Box::new(FakePermission { granted: true }),
+            Box::new(FakeShortcuts::available()),
+            Box::new(TerminalPendingRuntime::new(
+                Arc::clone(&finished),
+                Arc::clone(&starts),
+            )),
+            Arc::new(RecordingEmitter::default()),
+        );
+        service.save_config(valid_config()).unwrap();
+        service.start(valid_config()).unwrap();
+        assert_eq!(service.run_snapshot().status, RunStatus::Idle);
+
+        let pending = service.start(valid_config()).unwrap_err();
+
+        assert_eq!(pending.code, "run-terminal-pending");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        finished.store(true, Ordering::SeqCst);
+        assert_eq!(
+            service.start(valid_config()).unwrap().status,
+            RunStatus::Running
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        service.shutdown().unwrap();
     }
 
     #[test]
@@ -1190,6 +1353,87 @@ mod tests {
         assert_eq!(*starts.lock().unwrap(), 1);
     }
 
+    #[test]
+    fn shutdown_timeout_preserves_stop_paths_and_retry_then_closes() {
+        let directory = tempfile::tempdir().unwrap();
+        let escape_registered = Arc::new(AtomicBool::new(false));
+        let toggle_registered = Arc::new(AtomicBool::new(true));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let service = AppService::new(
+            ConfigRepository::new(directory.path()),
+            Box::new(FakePermission { granted: true }),
+            Box::new(TrackedShortcuts::new(
+                Arc::clone(&escape_registered),
+                Arc::clone(&toggle_registered),
+                None,
+            )),
+            Box::new(RetryShutdownRuntime::new(
+                Arc::clone(&starts),
+                Arc::clone(&shutdowns),
+                Some(2),
+                None,
+            )),
+            Arc::new(RecordingEmitter::default()),
+        );
+        service.save_config(valid_config()).unwrap();
+        service.start(valid_config()).unwrap();
+
+        assert_eq!(service.shutdown().unwrap_err().code, "wait-timeout");
+        assert!(escape_registered.load(Ordering::SeqCst));
+        assert!(toggle_registered.load(Ordering::SeqCst));
+        service.handle_shortcut(ShortcutAction::StopRun).unwrap();
+        service.handle_shortcut(ShortcutAction::ToggleRun).unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            service.start(valid_config()).unwrap_err().code,
+            "service-shutting-down"
+        );
+        assert_eq!(
+            service.save_config(valid_config()).unwrap_err().code,
+            "service-shutting-down"
+        );
+
+        service.shutdown().unwrap();
+
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 2);
+        assert!(!escape_registered.load(Ordering::SeqCst));
+        assert!(!toggle_registered.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn dropping_after_shutdown_timeout_releases_dispatcher_owned_resources() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime_dropped = Arc::new((Mutex::new(false), Condvar::new()));
+        let shortcuts_dropped = Arc::new((Mutex::new(false), Condvar::new()));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let service = AppService::new(
+            ConfigRepository::new(directory.path()),
+            Box::new(FakePermission { granted: true }),
+            Box::new(TrackedShortcuts::new(
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+                Some(Arc::clone(&shortcuts_dropped)),
+            )),
+            Box::new(RetryShutdownRuntime::new(
+                Arc::new(AtomicUsize::new(0)),
+                Arc::clone(&shutdowns),
+                None,
+                Some(Arc::clone(&runtime_dropped)),
+            )),
+            Arc::new(RecordingEmitter::default()),
+        );
+        service.save_config(valid_config()).unwrap();
+        service.start(valid_config()).unwrap();
+        assert_eq!(service.shutdown().unwrap_err().code, "wait-timeout");
+
+        drop(service);
+
+        wait_until_true(&runtime_dropped);
+        wait_until_true(&shortcuts_dropped);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+    }
+
     fn test_service(
         directory: &std::path::Path,
         permission: Box<dyn PermissionProvider>,
@@ -1257,6 +1501,273 @@ mod tests {
         }
     }
 
+    struct TrackedShortcuts {
+        active: String,
+        escape_registered: Arc<AtomicBool>,
+        toggle_registered: Arc<AtomicBool>,
+        dropped: Option<Signal>,
+    }
+
+    impl TrackedShortcuts {
+        fn new(
+            escape_registered: Arc<AtomicBool>,
+            toggle_registered: Arc<AtomicBool>,
+            dropped: Option<Signal>,
+        ) -> Self {
+            Self {
+                active: valid_config().global_shortcut,
+                escape_registered,
+                toggle_registered,
+                dropped,
+            }
+        }
+    }
+
+    impl Drop for TrackedShortcuts {
+        fn drop(&mut self) {
+            if let Some(dropped) = &self.dropped {
+                signal(dropped);
+            }
+        }
+    }
+
+    impl ShortcutController for TrackedShortcuts {
+        fn replace(&mut self, shortcut: &str) -> Result<String, ShortcutError> {
+            self.active = shortcut.to_owned();
+            self.toggle_registered.store(true, Ordering::SeqCst);
+            Ok(shortcut.to_owned())
+        }
+
+        fn active(&self) -> Option<&str> {
+            Some(&self.active)
+        }
+
+        fn toggle_registered(&self) -> bool {
+            self.toggle_registered.load(Ordering::SeqCst)
+        }
+
+        fn unregister_toggle(&mut self) -> Result<(), ShortcutError> {
+            self.toggle_registered.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn register_escape(&mut self) -> Result<(), ShortcutError> {
+            self.escape_registered.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn unregister_escape(&mut self) -> Result<(), ShortcutError> {
+            self.escape_registered.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn escape_registered(&self) -> bool {
+            self.escape_registered.load(Ordering::SeqCst)
+        }
+
+        fn unregister_all(&mut self) -> Result<(), ShortcutError> {
+            self.escape_registered.store(false, Ordering::SeqCst);
+            self.toggle_registered.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct RetryShutdownRuntime {
+        snapshot: Mutex<RunSnapshot>,
+        observer: Mutex<RuntimeObserver>,
+        starts: Arc<AtomicUsize>,
+        shutdowns: Arc<AtomicUsize>,
+        succeed_on: Option<usize>,
+        generation: AtomicUsize,
+        revision: AtomicUsize,
+        dropped: Option<Signal>,
+    }
+
+    impl RetryShutdownRuntime {
+        fn new(
+            starts: Arc<AtomicUsize>,
+            shutdowns: Arc<AtomicUsize>,
+            succeed_on: Option<usize>,
+            dropped: Option<Signal>,
+        ) -> Self {
+            Self {
+                snapshot: Mutex::new(RunSnapshot::idle()),
+                observer: Mutex::new(Arc::new(|_, _, _| {})),
+                starts,
+                shutdowns,
+                succeed_on,
+                generation: AtomicUsize::new(0),
+                revision: AtomicUsize::new(0),
+                dropped,
+            }
+        }
+
+        fn publish(&self, snapshot: RunSnapshot) {
+            *self.snapshot.lock().unwrap() = snapshot.clone();
+            let generation = self.generation.load(Ordering::SeqCst) as u64;
+            let revision = self.revision.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            Arc::clone(&self.observer.lock().unwrap())(generation, revision, snapshot);
+        }
+    }
+
+    impl Drop for RetryShutdownRuntime {
+        fn drop(&mut self) {
+            if let Some(dropped) = &self.dropped {
+                signal(dropped);
+            }
+        }
+    }
+
+    impl RuntimeService for RetryShutdownRuntime {
+        fn set_observer(&mut self, observer: RuntimeObserver) {
+            *self.observer.lock().unwrap() = observer;
+        }
+
+        fn start(&self, config: AppConfig) -> Result<Option<u64>, CommandError> {
+            if self.snapshot.lock().unwrap().status != RunStatus::Idle {
+                return Ok(None);
+            }
+            let generation = self.generation.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            self.revision.store(0, Ordering::SeqCst);
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            self.publish(RunSnapshot {
+                status: RunStatus::Running,
+                mode: Some(config.mode),
+                ..RunSnapshot::idle()
+            });
+            Ok(Some(generation))
+        }
+
+        fn stop(&self) -> bool {
+            if self.snapshot.lock().unwrap().status != RunStatus::Running {
+                return false;
+            }
+            self.publish(RunSnapshot {
+                status: RunStatus::Idle,
+                stop_reason: Some(StopReason::Requested),
+                ..RunSnapshot::idle()
+            });
+            true
+        }
+
+        fn snapshot(&self) -> RunSnapshot {
+            self.snapshot.lock().unwrap().clone()
+        }
+
+        fn shutdown(&self, _timeout: Duration) -> Result<(u64, u64, RunSnapshot), CommandError> {
+            let attempt = self.shutdowns.fetch_add(1, Ordering::SeqCst) + 1;
+            if self
+                .succeed_on
+                .is_none_or(|succeed_on| attempt < succeed_on)
+            {
+                return Err(CommandError::new("wait-timeout"));
+            }
+            self.stop();
+            Ok((
+                self.generation.load(Ordering::SeqCst) as u64,
+                self.revision.load(Ordering::SeqCst) as u64,
+                self.snapshot(),
+            ))
+        }
+    }
+
+    struct TerminalPendingRuntime {
+        snapshot: Mutex<RunSnapshot>,
+        observer: Mutex<RuntimeObserver>,
+        finished: Arc<AtomicBool>,
+        starts: Arc<AtomicUsize>,
+        generation: AtomicUsize,
+        revision: AtomicUsize,
+    }
+
+    impl TerminalPendingRuntime {
+        fn new(finished: Arc<AtomicBool>, starts: Arc<AtomicUsize>) -> Self {
+            Self {
+                snapshot: Mutex::new(RunSnapshot::idle()),
+                observer: Mutex::new(Arc::new(|_, _, _| {})),
+                finished,
+                starts,
+                generation: AtomicUsize::new(0),
+                revision: AtomicUsize::new(0),
+            }
+        }
+
+        fn publish(&self, generation: u64, snapshot: RunSnapshot) {
+            *self.snapshot.lock().unwrap() = snapshot.clone();
+            let revision = self.revision.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            Arc::clone(&self.observer.lock().unwrap())(generation, revision, snapshot);
+        }
+    }
+
+    impl RuntimeService for TerminalPendingRuntime {
+        fn set_observer(&mut self, observer: RuntimeObserver) {
+            *self.observer.lock().unwrap() = observer;
+        }
+
+        fn start(&self, config: AppConfig) -> Result<Option<u64>, CommandError> {
+            let current = self.generation.load(Ordering::SeqCst);
+            if current == 1 && !self.finished.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            if self.snapshot.lock().unwrap().status != RunStatus::Idle {
+                return Ok(None);
+            }
+            let generation = self.generation.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            self.revision.store(0, Ordering::SeqCst);
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            self.publish(
+                generation,
+                RunSnapshot {
+                    status: RunStatus::Running,
+                    mode: Some(config.mode),
+                    ..RunSnapshot::idle()
+                },
+            );
+            if generation == 1 {
+                self.publish(
+                    generation,
+                    RunSnapshot {
+                        status: RunStatus::Idle,
+                        mode: Some(config.mode),
+                        stop_reason: Some(StopReason::DurationComplete),
+                        ..RunSnapshot::idle()
+                    },
+                );
+            }
+            Ok(Some(generation))
+        }
+
+        fn stop(&self) -> bool {
+            if self.snapshot.lock().unwrap().status != RunStatus::Running {
+                return false;
+            }
+            let generation = self.generation.load(Ordering::SeqCst) as u64;
+            self.publish(
+                generation,
+                RunSnapshot {
+                    status: RunStatus::Idle,
+                    stop_reason: Some(StopReason::Requested),
+                    ..RunSnapshot::idle()
+                },
+            );
+            true
+        }
+
+        fn snapshot(&self) -> RunSnapshot {
+            self.snapshot.lock().unwrap().clone()
+        }
+
+        fn shutdown(&self, _timeout: Duration) -> Result<(u64, u64, RunSnapshot), CommandError> {
+            self.finished.store(true, Ordering::SeqCst);
+            self.stop();
+            Ok((
+                self.generation.load(Ordering::SeqCst) as u64,
+                self.revision.load(Ordering::SeqCst) as u64,
+                self.snapshot(),
+            ))
+        }
+    }
+
     struct FakeRuntime {
         snapshot: Mutex<RunSnapshot>,
         observer: Mutex<RuntimeObserver>,
@@ -1264,17 +1775,19 @@ mod tests {
         start_failures: Arc<AtomicUsize>,
         started_configs: Arc<Mutex<Vec<AppConfig>>>,
         generation: AtomicUsize,
+        revision: AtomicUsize,
     }
 
     impl FakeRuntime {
         fn new(starts: Arc<Mutex<usize>>) -> Self {
             Self {
                 snapshot: Mutex::new(RunSnapshot::idle()),
-                observer: Mutex::new(Arc::new(|_, _| {})),
+                observer: Mutex::new(Arc::new(|_, _, _| {})),
                 starts,
                 start_failures: Arc::new(AtomicUsize::new(0)),
                 started_configs: Arc::new(Mutex::new(Vec::new())),
                 generation: AtomicUsize::new(0),
+                revision: AtomicUsize::new(0),
             }
         }
 
@@ -1285,18 +1798,24 @@ mod tests {
         ) -> Self {
             Self {
                 snapshot: Mutex::new(RunSnapshot::idle()),
-                observer: Mutex::new(Arc::new(|_, _| {})),
+                observer: Mutex::new(Arc::new(|_, _, _| {})),
                 starts,
                 start_failures,
                 started_configs,
                 generation: AtomicUsize::new(0),
+                revision: AtomicUsize::new(0),
             }
         }
 
         fn publish(&self, snapshot: RunSnapshot) {
             *self.snapshot.lock().unwrap() = snapshot.clone();
             let observer = Arc::clone(&self.observer.lock().unwrap());
-            observer(self.generation.load(Ordering::SeqCst) as u64, snapshot);
+            let revision = self.revision.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            observer(
+                self.generation.load(Ordering::SeqCst) as u64,
+                revision,
+                snapshot,
+            );
         }
     }
 
@@ -1315,6 +1834,7 @@ mod tests {
             *self.starts.lock().unwrap() += 1;
             self.started_configs.lock().unwrap().push(config.clone());
             let generation = self.generation.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            self.revision.store(0, Ordering::SeqCst);
             self.publish(RunSnapshot {
                 status: RunStatus::Running,
                 mode: Some(config.mode),
@@ -1341,10 +1861,11 @@ mod tests {
             self.snapshot.lock().unwrap().clone()
         }
 
-        fn shutdown(&self, _timeout: Duration) -> Result<(u64, RunSnapshot), CommandError> {
+        fn shutdown(&self, _timeout: Duration) -> Result<(u64, u64, RunSnapshot), CommandError> {
             self.stop();
             Ok((
                 self.generation.load(Ordering::SeqCst) as u64,
+                self.revision.load(Ordering::SeqCst) as u64,
                 self.snapshot(),
             ))
         }

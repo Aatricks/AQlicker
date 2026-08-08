@@ -87,7 +87,7 @@ impl std::fmt::Display for StartError {
 impl std::error::Error for StartError {}
 
 pub type RunObserver = Arc<dyn Fn(RunSnapshot) + Send + Sync>;
-pub(crate) type TaggedRunObserver = Arc<dyn Fn(u64, RunSnapshot) + Send + Sync>;
+pub(crate) type TaggedRunObserver = Arc<dyn Fn(u64, u64, RunSnapshot) + Send + Sync>;
 
 #[derive(Debug, Clone, Copy)]
 enum Control {
@@ -101,6 +101,7 @@ struct RuntimeState {
     worker: Option<JoinHandle<()>>,
     worker_complete: bool,
     generation: u64,
+    revision: u64,
 }
 
 struct SharedState {
@@ -152,6 +153,8 @@ pub struct RunController {
     control: Mutex<Option<Sender<Control>>>,
     #[cfg(test)]
     before_worker_publish: Option<Arc<WorkerPublishGate>>,
+    #[cfg(test)]
+    before_worker_exit: Option<Arc<WorkerPublishGate>>,
 }
 
 #[cfg(test)]
@@ -205,18 +208,21 @@ impl RunController {
                     worker: None,
                     worker_complete: true,
                     generation: 0,
+                    revision: 0,
                 }),
                 terminal: Condvar::new(),
-                observer: Mutex::new(Arc::new(|_, _| {})),
+                observer: Mutex::new(Arc::new(|_, _, _| {})),
             }),
             control: Mutex::new(None),
             #[cfg(test)]
             before_worker_publish: None,
+            #[cfg(test)]
+            before_worker_exit: None,
         }
     }
 
     pub fn set_observer(&mut self, observer: RunObserver) {
-        *lock(&self.shared.observer) = Arc::new(move |_, snapshot| observer(snapshot));
+        *lock(&self.shared.observer) = Arc::new(move |_, _, snapshot| observer(snapshot));
     }
 
     pub(crate) fn set_tagged_observer(&mut self, observer: TaggedRunObserver) {
@@ -225,6 +231,10 @@ impl RunController {
 
     pub(crate) fn generation(&self) -> u64 {
         lock(&self.shared.state).generation
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        lock(&self.shared.state).revision
     }
 
     #[cfg(test)]
@@ -245,7 +255,7 @@ impl RunController {
     pub fn start(&self, request: AppConfig) -> Result<bool, StartError> {
         {
             let state = lock(&self.shared.state);
-            if !state.worker_complete {
+            if !worker_ready(&state) {
                 return Ok(false);
             }
             match state.snapshot.status {
@@ -275,10 +285,12 @@ impl RunController {
         };
         let sink = Arc::clone(&self.sink);
         let shared = Arc::clone(&self.shared);
+        #[cfg(test)]
+        let before_worker_exit = self.before_worker_exit.clone();
         let (sender, receiver) = mpsc::channel();
         let (launch_sender, launch_receiver) = mpsc::channel();
         let mut state = lock(&self.shared.state);
-        if !state.worker_complete {
+        if !worker_ready(&state) {
             return Ok(false);
         }
         match state.snapshot.status {
@@ -287,6 +299,7 @@ impl RunController {
             RunStatus::Idle => {}
         }
         if let Some(worker) = state.worker.take() {
+            debug_assert!(worker.is_finished());
             let _ = worker.join();
         }
         let run_started = Instant::now();
@@ -304,13 +317,18 @@ impl RunController {
         state.deadline = deadline;
         state.worker_complete = false;
         state.generation = state.generation.saturating_add(1);
+        state.revision = 0;
         *lock(&self.control) = Some(sender);
-        let running = state.snapshot.clone();
+        let running = next_event(&mut state);
         let spawn = thread::Builder::new()
             .name("aqlicker-input-run".to_owned())
             .spawn(move || {
                 if launch_receiver.recv().is_ok() {
                     worker_main(sink, shared, receiver, schedule, deadline, clock);
+                    #[cfg(test)]
+                    if let Some(gate) = before_worker_exit {
+                        gate.pause_once();
+                    }
                 }
             });
         let handle = match spawn {
@@ -322,7 +340,7 @@ impl RunController {
                 state.started_at = None;
                 state.deadline = None;
                 state.worker_complete = true;
-                let idle = state.snapshot.clone();
+                let idle = next_event(&mut state);
                 drop(state);
                 observe(&self.shared, idle);
                 return Err(StartError {
@@ -342,18 +360,18 @@ impl RunController {
     }
 
     pub fn stop(&self) -> bool {
-        let (should_signal, snapshot) = {
+        let (should_signal, event) = {
             let mut state = lock(&self.shared.state);
             match state.snapshot.status {
                 RunStatus::Running => {
                     state.snapshot.status = RunStatus::Stopping;
-                    (true, Some(state.snapshot.clone()))
+                    (true, Some(next_event(&mut state)))
                 }
                 RunStatus::Idle | RunStatus::Stopping | RunStatus::Failed => (false, None),
             }
         };
-        if let Some(snapshot) = snapshot {
-            observe(&self.shared, snapshot);
+        if let Some(event) = event {
+            observe(&self.shared, event);
         }
         if should_signal {
             if let Some(sender) = lock(&self.control).as_ref() {
@@ -379,7 +397,10 @@ impl RunController {
     }
 
     pub fn wait_for_terminal(&self, timeout: Duration) -> Result<RunSnapshot, StartError> {
-        let deadline = Instant::now() + timeout;
+        self.wait_for_terminal_until(Instant::now() + timeout)
+    }
+
+    fn wait_for_terminal_until(&self, deadline: Instant) -> Result<RunSnapshot, StartError> {
         let mut state = lock(&self.shared.state);
         while matches!(
             state.snapshot.status,
@@ -411,18 +432,42 @@ impl RunController {
         }
         let snapshot = state.snapshot.clone();
         drop(state);
+        loop {
+            let finished = {
+                let state = lock(&self.shared.state);
+                state.worker.as_ref().is_none_or(JoinHandle::is_finished)
+            };
+            if finished {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(StartError {
+                    code: "wait-timeout",
+                });
+            }
+            thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
         Ok(snapshot)
     }
 
     pub fn shutdown(&self, timeout: Duration) -> Result<RunSnapshot, StartError> {
+        let deadline = Instant::now() + timeout;
         self.stop();
-        let snapshot = self.wait_for_terminal(timeout)?;
-        self.reap_worker();
+        let snapshot = self.wait_for_terminal_until(deadline)?;
+        self.reap_finished_worker();
         Ok(snapshot)
     }
 
-    fn reap_worker(&self) {
-        let worker = lock(&self.shared.state).worker.take();
+    fn reap_finished_worker(&self) {
+        let worker = {
+            let mut state = lock(&self.shared.state);
+            if state.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+                state.worker.take()
+            } else {
+                None
+            }
+        };
         if let Some(worker) = worker {
             let _ = worker.join();
         }
@@ -435,7 +480,16 @@ impl Drop for RunController {
         if let Some(sender) = lock(&self.control).as_ref() {
             let _ = sender.send(Control::Cancel);
         }
-        self.reap_worker();
+        let worker = lock(&self.shared.state).worker.take();
+        if let Some(worker) = worker {
+            let deadline = Instant::now() + Duration::from_millis(100);
+            while !worker.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
+        }
     }
 }
 
@@ -570,9 +624,9 @@ fn execute_schedule(
         let mut state = lock(&shared.state);
         state.snapshot.successful_presses = state.snapshot.successful_presses.saturating_add(1);
         state.snapshot.elapsed_ms = duration_millis(clock.elapsed());
-        let snapshot = state.snapshot.clone();
+        let event = next_event(&mut state);
         drop(state);
-        observe(shared, snapshot);
+        observe(shared, event);
     }
 }
 
@@ -615,17 +669,25 @@ fn finish(shared: &SharedState, exit: WorkerExit, elapsed: Duration) {
             state.snapshot.error = Some(error);
         }
     }
-    let snapshot = state.snapshot.clone();
+    let event = next_event(&mut state);
     drop(state);
-    observe(shared, snapshot);
+    observe(shared, event);
     lock(&shared.state).worker_complete = true;
     shared.terminal.notify_all();
 }
 
-fn observe(shared: &SharedState, snapshot: RunSnapshot) {
+fn next_event(state: &mut RuntimeState) -> (u64, u64, RunSnapshot) {
+    state.revision = state.revision.saturating_add(1);
+    (state.generation, state.revision, state.snapshot.clone())
+}
+
+fn observe(shared: &SharedState, event: (u64, u64, RunSnapshot)) {
     let observer = Arc::clone(&lock(&shared.observer));
-    let generation = lock(&shared.state).generation;
-    observer(generation, snapshot);
+    observer(event.0, event.1, event.2);
+}
+
+fn worker_ready(state: &RuntimeState) -> bool {
+    state.worker_complete && state.worker.as_ref().is_none_or(JoinHandle::is_finished)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -814,6 +876,41 @@ mod tests {
                 code: "wait-timeout"
             }
         );
+        controller.shutdown(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn shutdown_timeout_includes_actual_worker_thread_exit() {
+        let exit_gate = Arc::new(WorkerPublishGate::new());
+        let mut controller = RunController::for_test_with_clock(
+            Box::new(TimedRecordingSink {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(VirtualClock::new()),
+        );
+        controller.before_worker_exit = Some(Arc::clone(&exit_gate));
+        let controller = Arc::new(controller);
+        controller.start(test_request(Mode::Timer)).unwrap();
+        wait_until_true(&exit_gate.entered);
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let shutdown_controller = Arc::clone(&controller);
+        let shutdown = thread::spawn(move || {
+            let result = shutdown_controller.shutdown(Duration::from_millis(20));
+            result_sender.send(result).unwrap();
+        });
+        let bounded = result_receiver.recv_timeout(Duration::from_millis(200));
+
+        signal(&exit_gate.released);
+        let eventual = match bounded {
+            Ok(result) => result,
+            Err(_) => result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+        };
+        shutdown.join().unwrap();
+
+        assert_eq!(eventual.unwrap_err().code, "wait-timeout");
         controller.shutdown(Duration::from_secs(1)).unwrap();
     }
 
@@ -1043,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn delayed_prior_worker_join_does_not_consume_the_new_run_duration() {
+    fn finished_prior_worker_reap_does_not_consume_the_new_run_duration() {
         let now = Arc::new(Mutex::new(Duration::ZERO));
         let origin = Arc::new(Mutex::new(None));
         let first_down_elapsed = Arc::new(Mutex::new(None));
@@ -1057,7 +1154,6 @@ mod tests {
             down_entered: Arc::clone(&down_entered),
             down_returned: Arc::clone(&down_returned),
         }));
-        let (factory_called, factory_observed) = std::sync::mpsc::channel();
         let clock_now = Arc::clone(&now);
         let clock_origin = Arc::clone(&origin);
         let recorded_run_started = Arc::clone(&clock_run_started);
@@ -1065,7 +1161,6 @@ mod tests {
             let origin = *clock_now.lock().unwrap();
             *clock_origin.lock().unwrap() = Some(origin);
             *recorded_run_started.lock().unwrap() = Some(run_started);
-            let _ = factory_called.send(());
             Arc::new(AbsoluteClock {
                 now: Arc::clone(&clock_now),
                 origin,
@@ -1073,9 +1168,16 @@ mod tests {
         });
         let prior_now = Arc::clone(&now);
         lock(&controller.shared.state).worker = Some(thread::spawn(move || {
-            let _ = factory_observed.recv_timeout(Duration::from_millis(100));
             *prior_now.lock().unwrap() = Duration::from_millis(500);
         }));
+        while !lock(&controller.shared.state)
+            .worker
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            thread::yield_now();
+        }
 
         controller.start(test_request(Mode::Timer)).unwrap();
         wait_until_true(&down_entered);
@@ -1293,6 +1395,65 @@ mod tests {
             })
         );
         assert_eq!(*events.lock().unwrap(), vec!["down:KeyA", "up:KeyA"]);
+    }
+
+    #[test]
+    fn terminal_revision_dominates_a_delayed_stopping_publication() {
+        let (mut controller, _sink_events, down_entered, down_returned) =
+            stop_race(StopRaceOutcome::KeyDownFailure);
+        let stopping_entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let stopping_released = Arc::new((Mutex::new(false), Condvar::new()));
+        let terminal_seen = Arc::new((Mutex::new(false), Condvar::new()));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::clone(&stopping_entered);
+        let released = Arc::clone(&stopping_released);
+        let terminal = Arc::clone(&terminal_seen);
+        let events = Arc::clone(&observed);
+        controller.set_tagged_observer(Arc::new(move |generation, revision, snapshot| {
+            if snapshot.status == RunStatus::Stopping {
+                signal(&entered);
+                let (lock, ready) = &*released;
+                let released = lock.lock().unwrap();
+                let _released = ready.wait_while(released, |released| !*released).unwrap();
+            }
+            events
+                .lock()
+                .unwrap()
+                .push((generation, revision, snapshot.status));
+            if matches!(snapshot.status, RunStatus::Idle | RunStatus::Failed) {
+                signal(&terminal);
+            }
+        }));
+        let controller = Arc::new(controller);
+        controller.start(test_request(Mode::Timer)).unwrap();
+        wait_until_true(&down_entered);
+
+        let stopping_controller = Arc::clone(&controller);
+        let stopping = thread::spawn(move || stopping_controller.stop());
+        wait_until_true(&stopping_entered);
+        signal(&down_returned);
+        wait_until_true(&terminal_seen);
+        signal(&stopping_released);
+        assert!(stopping.join().unwrap());
+        controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        let observed = observed.lock().unwrap();
+        let terminal = observed
+            .iter()
+            .find(|(_, _, status)| matches!(status, RunStatus::Idle | RunStatus::Failed))
+            .unwrap();
+        let stopping = observed
+            .iter()
+            .find(|(_, _, status)| *status == RunStatus::Stopping)
+            .unwrap();
+        assert_eq!(terminal.0, stopping.0);
+        assert!(terminal.1 > stopping.1);
+        assert!(
+            observed.iter().position(|event| event == terminal)
+                < observed.iter().position(|event| event == stopping)
+        );
     }
 
     type StopRace = (
