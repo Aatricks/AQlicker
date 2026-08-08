@@ -1,4 +1,20 @@
 use aqlicker_lib::{AppConfig, ConfigRepository, KeyEntry, LogicalKey};
+use std::collections::HashSet;
+
+#[test]
+fn supported_key_catalog_matches_the_exhaustive_golden_list() {
+    let expected: Vec<String> =
+        serde_json::from_str(include_str!("fixtures/logical-keys.json")).unwrap();
+    let serialized = serde_json::to_string(&LogicalKey::ALL[..]).unwrap();
+    let actual: Vec<String> = serde_json::from_str(&serialized).unwrap();
+
+    assert_eq!(
+        expected.iter().collect::<HashSet<_>>().len(),
+        expected.len()
+    );
+    assert_eq!(actual.iter().collect::<HashSet<_>>().len(), actual.len());
+    assert_eq!(actual, expected);
+}
 
 #[test]
 fn contract_deserializes_the_v1_fixture_with_camel_case_fields() {

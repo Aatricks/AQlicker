@@ -1,4 +1,5 @@
 import fixture from "../../src-tauri/tests/fixtures/config-v1.json";
+import logicalKeys from "../../src-tauri/tests/fixtures/logical-keys.json";
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_CONFIG,
@@ -10,6 +11,12 @@ import {
 } from "./config";
 
 describe("configuration contract", () => {
+  it("matches the exhaustive supported-key golden list without duplicates", () => {
+    expect(new Set(logicalKeys).size).toBe(logicalKeys.length);
+    expect(new Set(LOGICAL_KEYS).size).toBe(LOGICAL_KEYS.length);
+    expect(LOGICAL_KEYS).toEqual(logicalKeys);
+  });
+
   it("deserializes the v1 fixture with its exact camelCase schema", () => {
     const config = fixture as AppConfig;
 
@@ -38,7 +45,6 @@ describe("configuration contract", () => {
       globalShortcut: "CommandOrControl+Shift+K",
     });
     expect(serializeConfig(config)).toBe(JSON.stringify(fixture));
-    expect(LOGICAL_KEYS).toHaveLength(66);
   });
 
   it("reports field-specific validation errors and start-only empty selection", () => {
