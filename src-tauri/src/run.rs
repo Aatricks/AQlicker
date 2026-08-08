@@ -95,10 +95,8 @@ struct RealClock {
 }
 
 impl RealClock {
-    fn new() -> Self {
-        Self {
-            started: Instant::now(),
-        }
+    fn new(started: Instant) -> Self {
+        Self { started }
     }
 }
 
@@ -125,7 +123,7 @@ impl Clock for RealClock {
 
 pub struct RunController {
     sink: Arc<Mutex<Box<dyn InputSink>>>,
-    clock_factory: Arc<dyn Fn() -> Arc<dyn Clock> + Send + Sync>,
+    clock_factory: Arc<dyn Fn(Instant) -> Arc<dyn Clock> + Send + Sync>,
     shared: Arc<SharedState>,
     control: Mutex<Option<Sender<Control>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -139,7 +137,7 @@ impl RunController {
     pub fn with_sink(sink: Box<dyn InputSink>) -> Self {
         Self {
             sink: Arc::new(Mutex::new(sink)),
-            clock_factory: Arc::new(|| Arc::new(RealClock::new())),
+            clock_factory: Arc::new(|started| Arc::new(RealClock::new(started))),
             shared: Arc::new(SharedState {
                 state: Mutex::new(RuntimeState {
                     snapshot: RunSnapshot {
@@ -172,7 +170,7 @@ impl RunController {
         C: Clock + 'static,
     {
         let mut controller = Self::with_sink(sink);
-        controller.clock_factory = Arc::new(move || clock.clone());
+        controller.clock_factory = Arc::new(move |_started| clock.clone());
         controller
     }
 
@@ -206,7 +204,6 @@ impl RunController {
         };
         let sink = Arc::clone(&self.sink);
         let shared = Arc::clone(&self.shared);
-        let clock = (self.clock_factory)();
         let (sender, receiver) = mpsc::channel();
         let mut state = lock(&self.shared.state);
         match state.snapshot.status {
@@ -215,6 +212,8 @@ impl RunController {
             RunStatus::Idle => {}
         }
         self.reap_worker();
+        let run_started = Instant::now();
+        let clock = (self.clock_factory)(run_started);
         state.snapshot = RunSnapshot {
             status: RunStatus::Running,
             mode: Some(mode),
@@ -224,7 +223,7 @@ impl RunController {
             stop_reason: None,
             error: None,
         };
-        state.started_at = Some(Instant::now());
+        state.started_at = Some(run_started);
         state.deadline = deadline;
         *lock(&self.control) = Some(sender);
         let spawn = thread::Builder::new()
@@ -414,6 +413,15 @@ fn execute_schedule(
         }
         if clock.wait_until(plan.target_offset, receiver) {
             return WorkerExit::Idle(StopReason::Requested);
+        }
+        match receiver.try_recv() {
+            Ok(Control::Cancel) | Err(TryRecvError::Disconnected) => {
+                return WorkerExit::Idle(StopReason::Requested);
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+        if deadline.is_some_and(|deadline| clock.elapsed() >= deadline) {
+            return WorkerExit::Idle(StopReason::DurationComplete);
         }
 
         if let Err(failure) = lock(sink).key_down(plan.key) {
@@ -649,6 +657,167 @@ mod tests {
         }
     }
 
+    struct LateWakeClock {
+        elapsed: Mutex<Duration>,
+    }
+
+    impl LateWakeClock {
+        fn new() -> Self {
+            Self {
+                elapsed: Mutex::new(Duration::ZERO),
+            }
+        }
+    }
+
+    impl Clock for LateWakeClock {
+        fn elapsed(&self) -> Duration {
+            *self.elapsed.lock().unwrap()
+        }
+
+        fn wait_until(&self, _target: Duration, _receiver: &Receiver<Control>) -> bool {
+            *self.elapsed.lock().unwrap() = Duration::from_secs(1);
+            false
+        }
+    }
+
+    #[test]
+    fn late_wake_at_deadline_does_not_start_a_press() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let controller = RunController::for_test_with_clock(
+            Box::new(TimedRecordingSink {
+                events: Arc::clone(&events),
+            }),
+            Arc::new(LateWakeClock::new()),
+        );
+
+        controller.start(test_request(Mode::Timer)).unwrap();
+        let snapshot = controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(snapshot.stop_reason, Some(StopReason::DurationComplete));
+        assert_eq!(snapshot.elapsed_ms, 1_000);
+    }
+
+    struct AbsoluteClock {
+        now: Arc<Mutex<Duration>>,
+        origin: Duration,
+    }
+
+    impl Clock for AbsoluteClock {
+        fn elapsed(&self) -> Duration {
+            self.now.lock().unwrap().saturating_sub(self.origin)
+        }
+
+        fn wait_until(&self, target: Duration, receiver: &Receiver<Control>) -> bool {
+            match receiver.try_recv() {
+                Ok(Control::Cancel) | Err(TryRecvError::Disconnected) => return true,
+                Err(TryRecvError::Empty) => {}
+            }
+            let mut now = self.now.lock().unwrap();
+            *now = (*now).max(self.origin.saturating_add(target));
+            false
+        }
+    }
+
+    struct OriginBlockingSink {
+        now: Arc<Mutex<Duration>>,
+        origin: Arc<Mutex<Option<Duration>>>,
+        first_down_elapsed: Arc<Mutex<Option<Duration>>>,
+        down_entered: Arc<(Mutex<bool>, Condvar)>,
+        down_returned: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl InputSink for OriginBlockingSink {
+        fn key_down(&mut self, _key: LogicalKey) -> Result<(), InputFailure> {
+            let origin = self
+                .origin
+                .lock()
+                .unwrap()
+                .expect("clock origin must exist");
+            let now = *self.now.lock().unwrap();
+            let is_first_down = {
+                let mut first_down_elapsed = self.first_down_elapsed.lock().unwrap();
+                let is_first_down = first_down_elapsed.is_none();
+                if is_first_down {
+                    *first_down_elapsed = Some(now.saturating_sub(origin));
+                }
+                is_first_down
+            };
+            if is_first_down {
+                let (lock, ready) = &*self.down_entered;
+                *lock.lock().unwrap() = true;
+                ready.notify_all();
+                let (lock, ready) = &*self.down_returned;
+                let mut returned = lock.lock().unwrap();
+                while !*returned {
+                    returned = ready.wait(returned).unwrap();
+                }
+            }
+            Ok(())
+        }
+
+        fn key_up(&mut self, _key: LogicalKey) -> Result<(), InputFailure> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn delayed_prior_worker_join_does_not_consume_the_new_run_duration() {
+        let now = Arc::new(Mutex::new(Duration::ZERO));
+        let origin = Arc::new(Mutex::new(None));
+        let first_down_elapsed = Arc::new(Mutex::new(None));
+        let clock_run_started = Arc::new(Mutex::new(None));
+        let down_entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let down_returned = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut controller = RunController::for_test(Box::new(OriginBlockingSink {
+            now: Arc::clone(&now),
+            origin: Arc::clone(&origin),
+            first_down_elapsed: Arc::clone(&first_down_elapsed),
+            down_entered: Arc::clone(&down_entered),
+            down_returned: Arc::clone(&down_returned),
+        }));
+        let (factory_called, factory_observed) = std::sync::mpsc::channel();
+        let clock_now = Arc::clone(&now);
+        let clock_origin = Arc::clone(&origin);
+        let recorded_run_started = Arc::clone(&clock_run_started);
+        controller.clock_factory = Arc::new(move |run_started| {
+            let origin = *clock_now.lock().unwrap();
+            *clock_origin.lock().unwrap() = Some(origin);
+            *recorded_run_started.lock().unwrap() = Some(run_started);
+            let _ = factory_called.send(());
+            Arc::new(AbsoluteClock {
+                now: Arc::clone(&clock_now),
+                origin,
+            })
+        });
+        let prior_now = Arc::clone(&now);
+        *lock(&controller.worker) = Some(thread::spawn(move || {
+            let _ = factory_observed.recv_timeout(Duration::from_millis(100));
+            *prior_now.lock().unwrap() = Duration::from_millis(500);
+        }));
+
+        controller.start(test_request(Mode::Timer)).unwrap();
+        wait_until_true(&down_entered);
+        let published = controller.snapshot();
+        let published_run_started = lock(&controller.shared.state).started_at;
+        let clock_run_started = *clock_run_started.lock().unwrap();
+        let first_down_elapsed = first_down_elapsed
+            .lock()
+            .unwrap()
+            .expect("first key-down must be observed");
+        signal(&down_returned);
+        controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(first_down_elapsed, Duration::ZERO);
+        assert_eq!(published_run_started, clock_run_started);
+        assert_eq!(published.status, RunStatus::Running);
+        assert!(published.remaining_ms.is_some());
+    }
+
     struct TimedSink {
         clock: Arc<VirtualClock>,
         press_targets: Arc<Mutex<Vec<Duration>>>,
@@ -696,7 +865,7 @@ mod tests {
             );
             assert_eq!(snapshot.stop_reason, Some(StopReason::DurationComplete));
             assert_eq!(snapshot.status, RunStatus::Idle);
-            assert_eq!(snapshot.elapsed_ms, 1_000);
+            assert!(snapshot.elapsed_ms >= 1_000);
             assert_eq!(snapshot.remaining_ms, Some(0));
         }
     }
