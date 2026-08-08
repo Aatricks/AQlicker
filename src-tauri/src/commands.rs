@@ -8,7 +8,7 @@ use std::{
 };
 
 use serde::Serialize;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 use crate::{
     AppConfig, ConfigRepository, ConfigRepositoryError, RecoveryNotice, RunController, RunError,
@@ -738,52 +738,55 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[tauri::command]
-pub fn bootstrap(state: tauri::State<'_, AppService>) -> Result<BootstrapPayload, CommandError> {
-    state.bootstrap()
+/// Every command below is `async` so Tauri runs it off the main thread, and the
+/// blocking wait on the dispatcher reply happens on a blocking-pool thread. The
+/// dispatcher itself needs the main thread (global-shortcut registration runs on
+/// the event loop), so a command that blocked the main thread would deadlock.
+async fn on_service<T: Send + 'static>(
+    app: tauri::AppHandle,
+    call: impl FnOnce(&AppService) -> Result<T, CommandError> + Send + 'static,
+) -> Result<T, CommandError> {
+    tauri::async_runtime::spawn_blocking(move || call(&app.state::<AppService>()))
+        .await
+        .map_err(|_| CommandError::new("service-unavailable"))?
 }
 
 #[tauri::command]
-pub fn save_config(
-    config: AppConfig,
-    state: tauri::State<'_, AppService>,
-) -> Result<(), CommandError> {
-    state.save_config(config)
+pub async fn bootstrap(app: tauri::AppHandle) -> Result<BootstrapPayload, CommandError> {
+    on_service(app, AppService::bootstrap).await
 }
 
 #[tauri::command]
-pub fn start_run(
+pub async fn save_config(config: AppConfig, app: tauri::AppHandle) -> Result<(), CommandError> {
+    on_service(app, move |service| service.save_config(config)).await
+}
+
+#[tauri::command]
+pub async fn start_run(
     config: AppConfig,
-    state: tauri::State<'_, AppService>,
+    app: tauri::AppHandle,
 ) -> Result<RunSnapshot, CommandError> {
-    state.start(config)
+    on_service(app, move |service| service.start(config)).await
 }
 
 #[tauri::command]
-pub fn stop_run(state: tauri::State<'_, AppService>) -> Result<RunSnapshot, CommandError> {
-    state.stop()
+pub async fn stop_run(app: tauri::AppHandle) -> Result<RunSnapshot, CommandError> {
+    on_service(app, AppService::stop).await
 }
 
 #[tauri::command]
-pub fn request_access(
-    state: tauri::State<'_, AppService>,
-) -> Result<PermissionStatus, CommandError> {
-    state.request_access()
+pub async fn request_access(app: tauri::AppHandle) -> Result<PermissionStatus, CommandError> {
+    on_service(app, AppService::request_access).await
 }
 
 #[tauri::command]
-pub fn permission_status(
-    state: tauri::State<'_, AppService>,
-) -> Result<PermissionStatus, CommandError> {
-    state.permission_status()
+pub async fn permission_status(app: tauri::AppHandle) -> Result<PermissionStatus, CommandError> {
+    on_service(app, AppService::permission_status).await
 }
 
 #[tauri::command]
-pub fn set_shortcut(
-    shortcut: String,
-    state: tauri::State<'_, AppService>,
-) -> Result<String, CommandError> {
-    state.set_shortcut(shortcut)
+pub async fn set_shortcut(shortcut: String, app: tauri::AppHandle) -> Result<String, CommandError> {
+    on_service(app, move |service| service.set_shortcut(shortcut)).await
 }
 
 #[cfg(test)]
