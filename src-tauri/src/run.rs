@@ -56,6 +56,20 @@ pub struct RunSnapshot {
     pub error: Option<RunError>,
 }
 
+impl RunSnapshot {
+    pub const fn idle() -> Self {
+        Self {
+            status: RunStatus::Idle,
+            mode: None,
+            elapsed_ms: 0,
+            remaining_ms: None,
+            successful_presses: 0,
+            stop_reason: None,
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartError {
     pub code: &'static str,
@@ -68,6 +82,8 @@ impl std::fmt::Display for StartError {
 }
 
 impl std::error::Error for StartError {}
+
+pub type RunObserver = Arc<dyn Fn(RunSnapshot) + Send + Sync>;
 
 #[derive(Debug, Clone, Copy)]
 enum Control {
@@ -83,6 +99,7 @@ struct RuntimeState {
 struct SharedState {
     state: Mutex<RuntimeState>,
     terminal: Condvar,
+    observer: Mutex<RunObserver>,
 }
 
 trait Clock: Send + Sync {
@@ -140,23 +157,20 @@ impl RunController {
             clock_factory: Arc::new(|started| Arc::new(RealClock::new(started))),
             shared: Arc::new(SharedState {
                 state: Mutex::new(RuntimeState {
-                    snapshot: RunSnapshot {
-                        status: RunStatus::Idle,
-                        mode: None,
-                        elapsed_ms: 0,
-                        remaining_ms: None,
-                        successful_presses: 0,
-                        stop_reason: None,
-                        error: None,
-                    },
+                    snapshot: RunSnapshot::idle(),
                     started_at: None,
                     deadline: None,
                 }),
                 terminal: Condvar::new(),
+                observer: Mutex::new(Arc::new(|_| {})),
             }),
             control: Mutex::new(None),
             worker: Mutex::new(None),
         }
+    }
+
+    pub fn set_observer(&mut self, observer: RunObserver) {
+        *lock(&self.shared.observer) = observer;
     }
 
     #[cfg(test)]
@@ -226,6 +240,9 @@ impl RunController {
         state.started_at = Some(run_started);
         state.deadline = deadline;
         *lock(&self.control) = Some(sender);
+        let running = state.snapshot.clone();
+        drop(state);
+        observe(&self.shared, running);
         let spawn = thread::Builder::new()
             .name("aqlicker-input-run".to_owned())
             .spawn(move || worker_main(sink, shared, receiver, schedule, deadline, clock));
@@ -233,30 +250,36 @@ impl RunController {
             Ok(handle) => handle,
             Err(_) => {
                 *lock(&self.control) = None;
+                let mut state = lock(&self.shared.state);
                 state.snapshot.status = RunStatus::Idle;
                 state.snapshot.mode = None;
                 state.started_at = None;
+                let idle = state.snapshot.clone();
+                drop(state);
+                observe(&self.shared, idle);
                 return Err(StartError {
                     code: "worker-spawn-failed",
                 });
             }
         };
         *lock(&self.worker) = Some(handle);
-        drop(state);
         Ok(true)
     }
 
     pub fn stop(&self) -> bool {
-        let should_signal = {
+        let (should_signal, snapshot) = {
             let mut state = lock(&self.shared.state);
             match state.snapshot.status {
                 RunStatus::Running => {
                     state.snapshot.status = RunStatus::Stopping;
-                    true
+                    (true, Some(state.snapshot.clone()))
                 }
-                RunStatus::Idle | RunStatus::Stopping | RunStatus::Failed => false,
+                RunStatus::Idle | RunStatus::Stopping | RunStatus::Failed => (false, None),
             }
         };
+        if let Some(snapshot) = snapshot {
+            observe(&self.shared, snapshot);
+        }
         if should_signal {
             if let Some(sender) = lock(&self.control).as_ref() {
                 let _ = sender.send(Control::Cancel);
@@ -312,6 +335,13 @@ impl RunController {
         }
         let snapshot = state.snapshot.clone();
         drop(state);
+        Ok(snapshot)
+    }
+
+    pub fn shutdown(&self, timeout: Duration) -> Result<RunSnapshot, StartError> {
+        self.stop();
+        let snapshot = self.wait_for_terminal(timeout)?;
+        self.reap_worker();
         Ok(snapshot)
     }
 
@@ -463,6 +493,9 @@ fn execute_schedule(
         let mut state = lock(&shared.state);
         state.snapshot.successful_presses = state.snapshot.successful_presses.saturating_add(1);
         state.snapshot.elapsed_ms = duration_millis(clock.elapsed());
+        let snapshot = state.snapshot.clone();
+        drop(state);
+        observe(shared, snapshot);
     }
 }
 
@@ -505,7 +538,15 @@ fn finish(shared: &SharedState, exit: WorkerExit, elapsed: Duration) {
             state.snapshot.error = Some(error);
         }
     }
+    let snapshot = state.snapshot.clone();
+    drop(state);
+    observe(shared, snapshot);
     shared.terminal.notify_all();
+}
+
+fn observe(shared: &SharedState, snapshot: RunSnapshot) {
+    let observer = Arc::clone(&lock(&shared.observer));
+    observer(snapshot);
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -690,6 +731,35 @@ mod tests {
             *elapsed = (*elapsed).max(target);
             false
         }
+    }
+
+    #[test]
+    fn observer_receives_running_progress_and_terminal_snapshots() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = RunController::for_test_with_clock(
+            Box::new(TimedRecordingSink {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(VirtualClock::new()),
+        );
+        let captured = Arc::clone(&observed);
+        controller.set_observer(Arc::new(move |snapshot| {
+            captured.lock().unwrap().push(snapshot);
+        }));
+
+        controller.start(test_request(Mode::Timer)).unwrap();
+        controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.first().unwrap().status, RunStatus::Running);
+        assert!(
+            observed
+                .iter()
+                .any(|snapshot| snapshot.successful_presses > 0)
+        );
+        assert_eq!(observed.last().unwrap().status, RunStatus::Idle);
     }
 
     struct LateWakeClock {

@@ -6,6 +6,7 @@ use std::{
 };
 
 use atomic_write_file::AtomicWriteFile;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{AppConfig, CURRENT_SCHEMA_VERSION};
@@ -123,7 +124,8 @@ impl LoadedConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct RecoveryNotice {
     pub code: String,
 }
