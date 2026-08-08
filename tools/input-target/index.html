@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AQlicker input target</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 1.5rem; }
+  h1 { font-size: 1.2rem; }
+  #down { font-family: ui-monospace, monospace; }
+  table { border-collapse: collapse; margin-top: 1rem; width: 100%; }
+  th, td { border: 1px solid #999; padding: 2px 6px; text-align: left; font-family: ui-monospace, monospace; }
+  th { background: #eee; }
+  tr.up { color: #666; }
+  button { margin-right: .5rem; }
+</style>
+</head>
+<body>
+<h1>AQlicker input target</h1>
+<p>Focus this window and press keys. Everything stays in this page; nothing is sent anywhere.</p>
+<p>Still down: <strong id="down">(none)</strong> &mdash; events: <span id="count">0</span></p>
+<p><button id="clear" type="button">Clear</button><button id="export" type="button">Export JSON</button></p>
+<table>
+  <thead><tr><th>#</th><th>event</th><th>code</th><th>t (ms)</th><th>still down</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<script>
+const rows = [];
+const down = new Set();
+const tbody = document.getElementById("rows");
+const downEl = document.getElementById("down");
+const countEl = document.getElementById("count");
+
+function appendRow(type, code, t, stillDown) {
+  const row = { index: rows.length + 1, type, code, t: Math.round(t * 1000) / 1000, down: stillDown };
+  rows.push(row);
+  const tr = document.createElement("tr");
+  tr.className = type;
+  for (const cell of [row.index, type, code, row.t.toFixed(3), stillDown.join(" ") || "-"]) {
+    const td = document.createElement("td");
+    td.textContent = String(cell);
+    tr.appendChild(td);
+  }
+  tbody.appendChild(tr);
+  downEl.textContent = stillDown.join(" ") || "(none)";
+  countEl.textContent = String(rows.length);
+  tr.scrollIntoView?.({ block: "nearest" });
+}
+
+window.addEventListener("keydown", (event) => {
+  down.add(event.code);
+  appendRow("down", event.code, performance.now(), [...down]);
+});
+window.addEventListener("keyup", (event) => {
+  down.delete(event.code);
+  appendRow("up", event.code, performance.now(), [...down]);
+});
+
+document.getElementById("clear").addEventListener("click", (event) => {
+  event.currentTarget.blur(); // keep Space/Enter from re-triggering the button instead of being recorded
+  rows.length = 0;
+  down.clear();
+  tbody.replaceChildren();
+  downEl.textContent = "(none)";
+  countEl.textContent = "0";
+});
+
+document.getElementById("export").addEventListener("click", (event) => {
+  event.currentTarget.blur();
+  const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), stillDown: [...down], events: rows }, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "input-target-" + Date.now() + ".json";
+  a.click();
+  URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
