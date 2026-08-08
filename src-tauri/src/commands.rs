@@ -12,7 +12,7 @@ use tauri::Emitter;
 
 use crate::{
     AppConfig, ConfigRepository, ConfigRepositoryError, RecoveryNotice, RunController, RunError,
-    RunSnapshot, RunStatus,
+    RunSnapshot, RunStatus, StartOutcome,
     permission::{PermissionProvider, PermissionStatus},
     shortcuts::{ShortcutAction, ShortcutController, ShortcutError},
 };
@@ -60,7 +60,7 @@ pub type RuntimeObserver = Arc<dyn Fn(u64, u64, RunSnapshot) + Send + Sync>;
 
 pub trait RuntimeService: Send + Sync {
     fn set_observer(&mut self, observer: RuntimeObserver);
-    fn start(&self, config: AppConfig) -> Result<Option<u64>, CommandError>;
+    fn start(&self, config: AppConfig) -> Result<StartOutcome, CommandError>;
     fn stop(&self) -> bool;
     fn snapshot(&self) -> RunSnapshot;
     fn shutdown(&self, timeout: Duration) -> Result<(u64, u64, RunSnapshot), CommandError>;
@@ -71,10 +71,8 @@ impl RuntimeService for RunController {
         RunController::set_tagged_observer(self, observer);
     }
 
-    fn start(&self, config: AppConfig) -> Result<Option<u64>, CommandError> {
-        RunController::start(self, config)
-            .map(|started| started.then(|| self.generation()))
-            .map_err(|error| CommandError::new(error.code))
+    fn start(&self, config: AppConfig) -> Result<StartOutcome, CommandError> {
+        RunController::start(self, config).map_err(|error| CommandError::new(error.code))
     }
 
     fn stop(&self) -> bool {
@@ -131,7 +129,7 @@ impl RuntimeService for DesktopRuntime {
         *lock(&self.observer) = observer;
     }
 
-    fn start(&self, config: AppConfig) -> Result<Option<u64>, CommandError> {
+    fn start(&self, config: AppConfig) -> Result<StartOutcome, CommandError> {
         let mut controller = lock(&self.controller);
         if controller.is_none() {
             let mut created =
@@ -143,7 +141,6 @@ impl RuntimeService for DesktopRuntime {
             .as_ref()
             .unwrap()
             .start(config)
-            .map(|started| started.then(|| controller.as_ref().unwrap().generation()))
             .map_err(|error| CommandError::new(error.code))
     }
 
@@ -508,15 +505,28 @@ impl ServiceCore {
 
         let was_active = self.active_generation.is_some();
         match self.runtime.start(config.clone()) {
-            Ok(Some(generation)) => {
+            Ok(StartOutcome::Started { generation }) => {
                 self.active_generation = Some(generation);
                 self.current_config = Some(config);
             }
-            Ok(None) if !was_active => {
-                self.unregister_escape_or_fail()?;
+            Ok(StartOutcome::TerminalPending) => {
+                if !was_active {
+                    self.unregister_escape_or_fail()?;
+                }
                 return Err(CommandError::new("run-terminal-pending"));
             }
-            Ok(None) => {}
+            Ok(StartOutcome::BusyRunning) => {
+                self.visible_run = self.runtime.snapshot();
+                if !matches!(
+                    self.visible_run.status,
+                    RunStatus::Running | RunStatus::Stopping
+                ) {
+                    if !was_active {
+                        self.unregister_escape_or_fail()?;
+                    }
+                    return Err(CommandError::new("run-busy"));
+                }
+            }
             Err(error) => {
                 self.unregister_escape_or_fail()?;
                 return Err(error);
@@ -1174,6 +1184,44 @@ mod tests {
     }
 
     #[test]
+    fn prepublication_terminal_window_never_acknowledges_idle_start_or_toggle() {
+        for _ in 0..5 {
+            let directory = tempfile::tempdir().unwrap();
+            let controls = Arc::new(PrePublicationControls::new());
+            let service = AppService::new(
+                ConfigRepository::new(directory.path()),
+                Box::new(FakePermission { granted: true }),
+                Box::new(FakeShortcuts::available()),
+                Box::new(PrePublicationRuntime::new(Arc::clone(&controls))),
+                Arc::new(RecordingEmitter::default()),
+            );
+            service.save_config(valid_config()).unwrap();
+            assert_eq!(
+                service.start(valid_config()).unwrap().status,
+                RunStatus::Running
+            );
+            signal(&controls.trigger_terminal);
+            wait_until_true(&controls.idle_committed);
+
+            let start = service.start(valid_config());
+            let toggle = service.handle_shortcut(ShortcutAction::ToggleRun);
+
+            signal(&controls.publish_terminal);
+            wait_until_true(&controls.terminal_published);
+            let _ = service.run_snapshot();
+            assert_eq!(start.unwrap_err().code, "run-terminal-pending");
+            assert_eq!(toggle.unwrap_err().code, "run-terminal-pending");
+            assert_eq!(controls.starts.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                service.start(valid_config()).unwrap().status,
+                RunStatus::Running
+            );
+            assert_eq!(controls.starts.load(Ordering::SeqCst), 2);
+            service.shutdown().unwrap();
+        }
+    }
+
+    #[test]
     fn rapid_toggle_pairs_are_atomic_and_end_idle() {
         let directory = tempfile::tempdir().unwrap();
         let starts = Arc::new(Mutex::new(0));
@@ -1623,9 +1671,9 @@ mod tests {
             *self.observer.lock().unwrap() = observer;
         }
 
-        fn start(&self, config: AppConfig) -> Result<Option<u64>, CommandError> {
+        fn start(&self, config: AppConfig) -> Result<StartOutcome, CommandError> {
             if self.snapshot.lock().unwrap().status != RunStatus::Idle {
-                return Ok(None);
+                return Ok(StartOutcome::BusyRunning);
             }
             let generation = self.generation.fetch_add(1, Ordering::SeqCst) as u64 + 1;
             self.revision.store(0, Ordering::SeqCst);
@@ -1635,7 +1683,7 @@ mod tests {
                 mode: Some(config.mode),
                 ..RunSnapshot::idle()
             });
-            Ok(Some(generation))
+            Ok(StartOutcome::Started { generation })
         }
 
         fn stop(&self) -> bool {
@@ -1662,6 +1710,128 @@ mod tests {
             {
                 return Err(CommandError::new("wait-timeout"));
             }
+            self.stop();
+            Ok((
+                self.generation.load(Ordering::SeqCst) as u64,
+                self.revision.load(Ordering::SeqCst) as u64,
+                self.snapshot(),
+            ))
+        }
+    }
+
+    struct PrePublicationControls {
+        trigger_terminal: Signal,
+        idle_committed: Signal,
+        publish_terminal: Signal,
+        terminal_published: Signal,
+        starts: AtomicUsize,
+    }
+
+    impl PrePublicationControls {
+        fn new() -> Self {
+            Self {
+                trigger_terminal: Arc::new((Mutex::new(false), Condvar::new())),
+                idle_committed: Arc::new((Mutex::new(false), Condvar::new())),
+                publish_terminal: Arc::new((Mutex::new(false), Condvar::new())),
+                terminal_published: Arc::new((Mutex::new(false), Condvar::new())),
+                starts: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    struct PrePublicationRuntime {
+        snapshot: Arc<Mutex<RunSnapshot>>,
+        observer: Arc<Mutex<RuntimeObserver>>,
+        controls: Arc<PrePublicationControls>,
+        terminal_pending: Arc<AtomicBool>,
+        generation: Arc<AtomicUsize>,
+        revision: Arc<AtomicUsize>,
+    }
+
+    impl PrePublicationRuntime {
+        fn new(controls: Arc<PrePublicationControls>) -> Self {
+            Self {
+                snapshot: Arc::new(Mutex::new(RunSnapshot::idle())),
+                observer: Arc::new(Mutex::new(Arc::new(|_, _, _| {}))),
+                controls,
+                terminal_pending: Arc::new(AtomicBool::new(false)),
+                generation: Arc::new(AtomicUsize::new(0)),
+                revision: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn publish(&self, snapshot: RunSnapshot) {
+            *self.snapshot.lock().unwrap() = snapshot.clone();
+            let generation = self.generation.load(Ordering::SeqCst) as u64;
+            let revision = self.revision.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            Arc::clone(&self.observer.lock().unwrap())(generation, revision, snapshot);
+        }
+    }
+
+    impl RuntimeService for PrePublicationRuntime {
+        fn set_observer(&mut self, observer: RuntimeObserver) {
+            *self.observer.lock().unwrap() = observer;
+        }
+
+        fn start(&self, config: AppConfig) -> Result<StartOutcome, CommandError> {
+            if self.terminal_pending.load(Ordering::SeqCst) {
+                return Ok(StartOutcome::TerminalPending);
+            }
+            if self.snapshot.lock().unwrap().status != RunStatus::Idle {
+                return Ok(StartOutcome::BusyRunning);
+            }
+            let generation = self.generation.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            self.revision.store(0, Ordering::SeqCst);
+            self.controls.starts.fetch_add(1, Ordering::SeqCst);
+            self.publish(RunSnapshot {
+                status: RunStatus::Running,
+                mode: Some(config.mode),
+                ..RunSnapshot::idle()
+            });
+            if generation == 1 {
+                let snapshot = Arc::clone(&self.snapshot);
+                let observer = Arc::clone(&self.observer);
+                let controls = Arc::clone(&self.controls);
+                let terminal_pending = Arc::clone(&self.terminal_pending);
+                let revision = Arc::clone(&self.revision);
+                thread::spawn(move || {
+                    wait_until_true(&controls.trigger_terminal);
+                    terminal_pending.store(true, Ordering::SeqCst);
+                    let terminal = RunSnapshot {
+                        status: RunStatus::Idle,
+                        mode: Some(config.mode),
+                        stop_reason: Some(StopReason::DurationComplete),
+                        ..RunSnapshot::idle()
+                    };
+                    *snapshot.lock().unwrap() = terminal.clone();
+                    let terminal_revision = revision.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+                    signal(&controls.idle_committed);
+                    wait_until_true(&controls.publish_terminal);
+                    Arc::clone(&observer.lock().unwrap())(generation, terminal_revision, terminal);
+                    terminal_pending.store(false, Ordering::SeqCst);
+                    signal(&controls.terminal_published);
+                });
+            }
+            Ok(StartOutcome::Started { generation })
+        }
+
+        fn stop(&self) -> bool {
+            if self.snapshot.lock().unwrap().status != RunStatus::Running {
+                return false;
+            }
+            self.publish(RunSnapshot {
+                status: RunStatus::Idle,
+                stop_reason: Some(StopReason::Requested),
+                ..RunSnapshot::idle()
+            });
+            true
+        }
+
+        fn snapshot(&self) -> RunSnapshot {
+            self.snapshot.lock().unwrap().clone()
+        }
+
+        fn shutdown(&self, _timeout: Duration) -> Result<(u64, u64, RunSnapshot), CommandError> {
             self.stop();
             Ok((
                 self.generation.load(Ordering::SeqCst) as u64,
@@ -1704,13 +1874,13 @@ mod tests {
             *self.observer.lock().unwrap() = observer;
         }
 
-        fn start(&self, config: AppConfig) -> Result<Option<u64>, CommandError> {
+        fn start(&self, config: AppConfig) -> Result<StartOutcome, CommandError> {
             let current = self.generation.load(Ordering::SeqCst);
             if current == 1 && !self.finished.load(Ordering::SeqCst) {
-                return Ok(None);
+                return Ok(StartOutcome::TerminalPending);
             }
             if self.snapshot.lock().unwrap().status != RunStatus::Idle {
-                return Ok(None);
+                return Ok(StartOutcome::BusyRunning);
             }
             let generation = self.generation.fetch_add(1, Ordering::SeqCst) as u64 + 1;
             self.revision.store(0, Ordering::SeqCst);
@@ -1734,7 +1904,7 @@ mod tests {
                     },
                 );
             }
-            Ok(Some(generation))
+            Ok(StartOutcome::Started { generation })
         }
 
         fn stop(&self) -> bool {
@@ -1824,9 +1994,9 @@ mod tests {
             *self.observer.lock().unwrap() = observer;
         }
 
-        fn start(&self, config: AppConfig) -> Result<Option<u64>, CommandError> {
+        fn start(&self, config: AppConfig) -> Result<StartOutcome, CommandError> {
             if self.snapshot.lock().unwrap().status != RunStatus::Idle {
-                return Ok(None);
+                return Ok(StartOutcome::BusyRunning);
             }
             if consume_failure(&self.start_failures) {
                 return Err(CommandError::new("start-failed"));
@@ -1841,7 +2011,7 @@ mod tests {
                 remaining_ms: config.stop_after.map(|seconds| u64::from(seconds) * 1_000),
                 ..RunSnapshot::idle()
             });
-            Ok(Some(generation))
+            Ok(StartOutcome::Started { generation })
         }
 
         fn stop(&self) -> bool {

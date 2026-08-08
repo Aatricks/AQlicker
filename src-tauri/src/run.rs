@@ -86,6 +86,13 @@ impl std::fmt::Display for StartError {
 
 impl std::error::Error for StartError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartOutcome {
+    Started { generation: u64 },
+    BusyRunning,
+    TerminalPending,
+}
+
 pub type RunObserver = Arc<dyn Fn(RunSnapshot) + Send + Sync>;
 pub(crate) type TaggedRunObserver = Arc<dyn Fn(u64, u64, RunSnapshot) + Send + Sync>;
 
@@ -108,6 +115,8 @@ struct SharedState {
     state: Mutex<RuntimeState>,
     terminal: Condvar,
     observer: Mutex<TaggedRunObserver>,
+    #[cfg(test)]
+    before_terminal_publish: Mutex<Option<Arc<WorkerPublishGate>>>,
 }
 
 trait Clock: Send + Sync {
@@ -212,6 +221,8 @@ impl RunController {
                 }),
                 terminal: Condvar::new(),
                 observer: Mutex::new(Arc::new(|_, _, _| {})),
+                #[cfg(test)]
+                before_terminal_publish: Mutex::new(None),
             }),
             control: Mutex::new(None),
             #[cfg(test)]
@@ -252,14 +263,17 @@ impl RunController {
         controller
     }
 
-    pub fn start(&self, request: AppConfig) -> Result<bool, StartError> {
+    pub fn start(&self, request: AppConfig) -> Result<StartOutcome, StartError> {
         {
             let state = lock(&self.shared.state);
-            if !worker_ready(&state) {
-                return Ok(false);
-            }
             match state.snapshot.status {
-                RunStatus::Running | RunStatus::Stopping => return Ok(false),
+                RunStatus::Running | RunStatus::Stopping => return Ok(StartOutcome::BusyRunning),
+                RunStatus::Idle if !worker_ready(&state) => {
+                    return Ok(StartOutcome::TerminalPending);
+                }
+                RunStatus::Failed if !worker_ready(&state) => {
+                    return Ok(StartOutcome::TerminalPending);
+                }
                 RunStatus::Failed => return Err(StartError { code: "run-failed" }),
                 RunStatus::Idle => {}
             }
@@ -290,11 +304,14 @@ impl RunController {
         let (sender, receiver) = mpsc::channel();
         let (launch_sender, launch_receiver) = mpsc::channel();
         let mut state = lock(&self.shared.state);
-        if !worker_ready(&state) {
-            return Ok(false);
-        }
         match state.snapshot.status {
-            RunStatus::Running | RunStatus::Stopping => return Ok(false),
+            RunStatus::Running | RunStatus::Stopping => return Ok(StartOutcome::BusyRunning),
+            RunStatus::Idle if !worker_ready(&state) => {
+                return Ok(StartOutcome::TerminalPending);
+            }
+            RunStatus::Failed if !worker_ready(&state) => {
+                return Ok(StartOutcome::TerminalPending);
+            }
             RunStatus::Failed => return Err(StartError { code: "run-failed" }),
             RunStatus::Idle => {}
         }
@@ -353,10 +370,11 @@ impl RunController {
             gate.pause_once();
         }
         state.worker = Some(handle);
+        let generation = state.generation;
         drop(state);
         observe(&self.shared, running);
         let _ = launch_sender.send(());
-        Ok(true)
+        Ok(StartOutcome::Started { generation })
     }
 
     pub fn stop(&self) -> bool {
@@ -671,6 +689,10 @@ fn finish(shared: &SharedState, exit: WorkerExit, elapsed: Duration) {
     }
     let event = next_event(&mut state);
     drop(state);
+    #[cfg(test)]
+    if let Some(gate) = lock(&shared.before_terminal_publish).as_ref() {
+        gate.pause_once();
+    }
     observe(shared, event);
     lock(&shared.state).worker_complete = true;
     shared.terminal.notify_all();
@@ -780,8 +802,14 @@ mod tests {
             down_entered: Arc::clone(&down_entered),
         }));
 
-        assert!(controller.start(test_request(Mode::Timer)).unwrap());
-        assert!(!controller.start(test_request(Mode::Timer)).unwrap());
+        assert!(matches!(
+            controller.start(test_request(Mode::Timer)).unwrap(),
+            StartOutcome::Started { .. }
+        ));
+        assert_eq!(
+            controller.start(test_request(Mode::Timer)).unwrap(),
+            StartOutcome::BusyRunning
+        );
         wait_until_true(&down_entered);
         assert!(controller.stop());
         assert!(!controller.stop());
@@ -817,7 +845,7 @@ mod tests {
         let starts = starters
             .into_iter()
             .map(|starter| starter.join().unwrap())
-            .filter(|started| *started)
+            .filter(|outcome| matches!(outcome, StartOutcome::Started { .. }))
             .count();
 
         assert_eq!(starts, 1);
@@ -948,15 +976,46 @@ mod tests {
 
         signal(&publish_gate.released);
         signal(&observer_released);
-        let first_started = first.join().unwrap().unwrap();
-        let second_started = second.join().unwrap().unwrap();
+        let first_outcome = first.join().unwrap().unwrap();
+        let second_outcome = second.join().unwrap().unwrap();
         controller.shutdown(Duration::from_secs(1)).unwrap();
 
         assert!(
             !terminal_before_publication,
             "worker reached a terminal observer before its handle was published"
         );
-        assert_eq!(usize::from(first_started) + usize::from(second_started), 1);
+        assert_eq!(
+            [first_outcome, second_outcome]
+                .into_iter()
+                .filter(|outcome| matches!(outcome, StartOutcome::Started { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn idle_before_terminal_publication_reports_terminal_pending() {
+        let terminal_gate = Arc::new(WorkerPublishGate::new());
+        let controller = RunController::for_test_with_clock(
+            Box::new(TimedRecordingSink {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(VirtualClock::new()),
+        );
+        *lock(&controller.shared.before_terminal_publish) = Some(Arc::clone(&terminal_gate));
+        controller.start(test_request(Mode::Timer)).unwrap();
+        wait_until_true(&terminal_gate.entered);
+
+        assert_eq!(controller.snapshot().status, RunStatus::Idle);
+        assert_eq!(
+            controller.start(test_request(Mode::Timer)).unwrap(),
+            StartOutcome::TerminalPending
+        );
+
+        signal(&terminal_gate.released);
+        controller
+            .wait_for_terminal(Duration::from_secs(1))
+            .unwrap();
     }
 
     #[derive(Clone)]

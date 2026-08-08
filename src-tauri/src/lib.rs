@@ -30,7 +30,8 @@ pub use persistence::{
     ConfigRepository, ConfigRepositoryError, LoadedConfig, RecoveryNotice, migrate_to_current,
 };
 pub use run::{
-    RunController, RunError, RunObserver, RunSnapshot, RunStatus, StartError, StopReason,
+    RunController, RunError, RunObserver, RunSnapshot, RunStatus, StartError, StartOutcome,
+    StopReason,
 };
 pub use shortcuts::{ShortcutAction, ShortcutError};
 
