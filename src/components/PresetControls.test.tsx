@@ -126,6 +126,25 @@ describe("PresetControls", () => {
     });
   });
 
+  it("accepts a rename to another preset's exact name", () => {
+    const onChange = vi.fn();
+    const config = twoPresets();
+    render(
+      <PresetControls config={config} disabled={false} onChange={onChange} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename preset" }));
+    fireEvent.change(screen.getByRole("textbox", { name: /Preset name/ }), {
+      target: { value: "First" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save name" }));
+
+    expect(onChange).toHaveBeenCalledWith({
+      ...config,
+      presets: [config.presets[0], { ...config.presets[1], name: "First" }],
+    });
+  });
+
   it("refuses a name longer than sixty characters", () => {
     const onChange = vi.fn();
     render(
@@ -153,6 +172,22 @@ describe("PresetControls", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Save name" }));
     expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a stored name error so the save gate never blocks silently", () => {
+    render(
+      <PresetControls
+        config={twoPresets()}
+        disabled={false}
+        errors={{ "presets[1].name": "Name the preset" }}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Name the preset");
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename preset" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Name the preset");
   });
 
   it("deletes the active preset and activates a survivor", () => {

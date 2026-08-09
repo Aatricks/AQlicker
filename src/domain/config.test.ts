@@ -211,6 +211,19 @@ describe("configuration contract", () => {
     ).toContainEqual({ field: "presets[1].name", code: "range" });
   });
 
+  it("allows two presets to share a name", () => {
+    // Identity is the id. Two presets may be named the same on purpose.
+    const shared: AppConfig = {
+      ...configWith({ name: "Grinding" }),
+      presets: [
+        { ...DEFAULT_PRESET, id: "first", name: "Grinding" },
+        { ...DEFAULT_PRESET, id: "second", name: "Grinding" },
+      ],
+    };
+
+    expect(validateConfig(shared)).toEqual([]);
+  });
+
   it("requires a resolvable active preset and at least one preset", () => {
     expect(
       validateConfig({ ...configWith({}), activePresetId: "missing" }),
