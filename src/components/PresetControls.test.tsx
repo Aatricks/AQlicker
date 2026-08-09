@@ -7,6 +7,7 @@ import {
   validateConfig,
   type AppConfig,
 } from "../domain/config";
+import { validateConfig as validateUiConfig } from "../domain/validation";
 import { PresetControls } from "./PresetControls";
 
 function twoPresets(): AppConfig {
@@ -135,6 +136,17 @@ describe("PresetControls", () => {
         );
       }
       expect(new Set(config.presets.map(({ id }) => id)).size).toBe(3);
+
+      // At the limit the suffix has nowhere to go, so the copies carry the
+      // source name. That is correct — names may repeat, the id is identity —
+      // and it is the exact case a reintroduced uniquifier would spin on.
+      if (length === MAX_PRESET_NAME_LENGTH) {
+        expect(config.presets.map(({ name }) => name)).toEqual([
+          name,
+          name,
+          name,
+        ]);
+      }
     },
   );
 
@@ -211,11 +223,22 @@ describe("PresetControls", () => {
   });
 
   it("surfaces a stored name error so the save gate never blocks silently", () => {
+    // Built from the real validator, not a literal: a hand-written key can
+    // name a shape the validator no longer produces.
+    const config: AppConfig = {
+      ...twoPresets(),
+      presets: twoPresets().presets.map((preset) =>
+        preset.id === "second" ? { ...preset, name: "  " } : preset,
+      ),
+    };
+    const errors = validateUiConfig(config);
+    expect(Object.keys(errors).length).toBeGreaterThan(0);
+
     render(
       <PresetControls
-        config={twoPresets()}
+        config={config}
         disabled={false}
-        errors={{ "presets[1].name": "Name the preset" }}
+        errors={errors}
         onChange={vi.fn()}
       />,
     );

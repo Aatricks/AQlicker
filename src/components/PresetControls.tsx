@@ -36,12 +36,9 @@ export function PresetControls({
   const [nameError, setNameError] = useState<string | null>(null);
 
   const active = config.presets.find(({ id }) => id === config.activePresetId);
-  const activeIndex = config.presets.findIndex(
-    ({ id }) => id === config.activePresetId,
-  );
   const onlyOne = config.presets.length <= 1;
-  const storedNameError =
-    activeIndex >= 0 ? errors[`presets[${activeIndex}].name`] : undefined;
+  // The active preset's messages are unprefixed: its controls are on screen.
+  const storedNameError = errors.name;
 
   const mutate = (next: AppConfig) => {
     if (disabled) return;
