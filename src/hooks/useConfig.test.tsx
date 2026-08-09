@@ -1,14 +1,19 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AqlickerApi, BootstrapPayload } from "../api/aqlicker";
-import { DEFAULT_CONFIG } from "../domain/config";
+import { DEFAULT_CONFIG, DEFAULT_PRESET, type Preset } from "../domain/config";
 import { useConfig } from "./useConfig";
 
 function bootstrap(): BootstrapPayload {
   return {
     config: {
       ...DEFAULT_CONFIG,
-      keys: [{ key: "KeyA", weight: 1, cooldownMs: 0 }],
+      presets: [
+        {
+          ...DEFAULT_PRESET,
+          keys: [{ key: "KeyA", weight: 1, cooldownMs: 0 }],
+        },
+      ],
     },
     recoveryNotice: null,
     permission: { granted: true, sameIntegrityOnly: false },
@@ -39,6 +44,22 @@ function fakeApi(payload = bootstrap()) {
   } as unknown as AqlickerApi;
 }
 
+/**
+ * Asserts on the whole `presets` array, not just one field of it: a save that
+ * wrote a stale document would still satisfy a per-field matcher.
+ */
+function onlyPresetWith(overrides: Partial<Preset>) {
+  return expect.objectContaining({
+    presets: [
+      {
+        ...DEFAULT_PRESET,
+        keys: [{ key: "KeyA", weight: 1, cooldownMs: 0 }],
+        ...overrides,
+      },
+    ],
+  });
+}
+
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -63,7 +84,7 @@ describe("useConfig", () => {
 
     vi.useFakeTimers();
     act(() => {
-      result.current.updateConfig((current) => ({
+      result.current.updatePreset((current) => ({
         ...current,
         timer: { intervalMs: 125 },
       }));
@@ -72,7 +93,7 @@ describe("useConfig", () => {
     expect(api.saveConfig).not.toHaveBeenCalled();
 
     act(() => {
-      result.current.updateConfig((current) => ({
+      result.current.updatePreset((current) => ({
         ...current,
         timer: { intervalMs: 150 },
       }));
@@ -83,11 +104,11 @@ describe("useConfig", () => {
     await act(async () => vi.advanceTimersByTimeAsync(1));
     expect(api.saveConfig).toHaveBeenCalledTimes(1);
     expect(api.saveConfig).toHaveBeenLastCalledWith(
-      expect.objectContaining({ timer: { intervalMs: 150 } }),
+      onlyPresetWith({ timer: { intervalMs: 150 } }),
     );
 
     act(() => {
-      result.current.updateConfig((current) => ({
+      result.current.updatePreset((current) => ({
         ...current,
         timer: { intervalMs: 39 },
       }));
@@ -97,6 +118,73 @@ describe("useConfig", () => {
     expect(result.current.errors["timer.intervalMs"]).toMatch(/40/);
   });
 
+  it("never writes one preset's contents into another's slot across an in-flight save", async () => {
+    const payload = bootstrap();
+    payload.config = {
+      ...payload.config,
+      presets: [
+        { ...DEFAULT_PRESET, id: "first", name: "First" },
+        { ...DEFAULT_PRESET, id: "second", name: "Second" },
+      ],
+      activePresetId: "first",
+    };
+    const firstSave = deferred<void>();
+    let durableConfig = payload.config;
+    const api = fakeApi(payload);
+    vi.mocked(api.saveConfig)
+      .mockImplementationOnce(async (candidate) => {
+        await firstSave.promise;
+        durableConfig = candidate;
+      })
+      .mockImplementation(async (candidate) => {
+        durableConfig = candidate;
+      });
+    const { result } = renderHook(() => useConfig(api));
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+    vi.useFakeTimers();
+
+    // Edit the first preset, let its save leave, then switch and edit the
+    // second one while that save is still outstanding.
+    act(() => {
+      result.current.updatePreset((current) => ({
+        ...current,
+        timer: { intervalMs: 111 },
+      }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(api.saveConfig).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        activePresetId: "second",
+      }));
+    });
+    act(() => {
+      result.current.updatePreset((current) => ({
+        ...current,
+        timer: { intervalMs: 222 },
+      }));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+
+    await act(async () => {
+      firstSave.resolve();
+      await firstSave.promise;
+    });
+
+    const expected = {
+      ...payload.config,
+      activePresetId: "second",
+      presets: [
+        { ...DEFAULT_PRESET, id: "first", name: "First", timer: { intervalMs: 111 } },
+        { ...DEFAULT_PRESET, id: "second", name: "Second", timer: { intervalMs: 222 } },
+      ],
+    };
+    expect(api.saveConfig).toHaveBeenLastCalledWith(expected);
+    expect(durableConfig).toEqual(expected);
+  });
+
   it("cancels a pending save when the hook unmounts", async () => {
     const api = fakeApi();
     const { result, unmount } = renderHook(() => useConfig(api));
@@ -104,7 +192,7 @@ describe("useConfig", () => {
 
     vi.useFakeTimers();
     act(() => {
-      result.current.updateConfig((current) => ({
+      result.current.updatePreset((current) => ({
         ...current,
         stopAfter: 300,
       }));
@@ -122,14 +210,14 @@ describe("useConfig", () => {
 
     vi.useFakeTimers();
     act(() => {
-      result.current.updateConfig((current) => ({ ...current, keys: [] }));
+      result.current.updatePreset((current) => ({ ...current, keys: [] }));
     });
     expect(result.current.errors.keys).toBeUndefined();
     expect(result.current.startErrors.keys).toBe("Choose at least one key");
 
     await act(async () => vi.advanceTimersByTimeAsync(250));
     expect(api.saveConfig).toHaveBeenCalledWith(
-      expect.objectContaining({ keys: [] }),
+      onlyPresetWith({ keys: [] }),
     );
   });
 
@@ -187,7 +275,7 @@ describe("useConfig", () => {
     vi.useFakeTimers();
 
     act(() => {
-      result.current.updateConfig((current) => ({
+      result.current.updatePreset((current) => ({
         ...current,
         timer: { intervalMs: 125 },
       }));
@@ -196,7 +284,7 @@ describe("useConfig", () => {
     expect(api.saveConfig).toHaveBeenCalledTimes(1);
 
     act(() => {
-      result.current.updateConfig((current) => ({
+      result.current.updatePreset((current) => ({
         ...current,
         timer: { intervalMs: 39 },
       }));
@@ -240,7 +328,7 @@ describe("useConfig", () => {
     vi.useFakeTimers();
 
     act(() => {
-      result.current.updateConfig((current) => ({
+      result.current.updatePreset((current) => ({
         ...current,
         timer: { intervalMs: 125 },
       }));
@@ -248,7 +336,7 @@ describe("useConfig", () => {
     await act(async () => vi.advanceTimersByTimeAsync(250));
 
     act(() => {
-      result.current.updateConfig((current) => ({
+      result.current.updatePreset((current) => ({
         ...current,
         timer: { intervalMs: 150 },
       }));
@@ -263,10 +351,10 @@ describe("useConfig", () => {
 
     expect(api.saveConfig).toHaveBeenCalledTimes(2);
     expect(api.saveConfig).toHaveBeenLastCalledWith(
-      expect.objectContaining({ timer: { intervalMs: 150 } }),
+      onlyPresetWith({ timer: { intervalMs: 150 } }),
     );
     expect(maximumActiveSaves).toBe(1);
-    expect(durableConfig.timer.intervalMs).toBe(150);
+    expect(durableConfig.presets[0].timer.intervalMs).toBe(150);
   });
 
   it("continues with the latest queued draft after an in-flight save fails", async () => {
@@ -286,14 +374,14 @@ describe("useConfig", () => {
     vi.useFakeTimers();
 
     act(() => {
-      result.current.updateConfig((current) => ({
+      result.current.updatePreset((current) => ({
         ...current,
         timer: { intervalMs: 125 },
       }));
     });
     await act(async () => vi.advanceTimersByTimeAsync(250));
     act(() => {
-      result.current.updateConfig((current) => ({
+      result.current.updatePreset((current) => ({
         ...current,
         timer: { intervalMs: 150 },
       }));
@@ -307,9 +395,9 @@ describe("useConfig", () => {
 
     expect(api.saveConfig).toHaveBeenCalledTimes(2);
     expect(api.saveConfig).toHaveBeenLastCalledWith(
-      expect.objectContaining({ timer: { intervalMs: 150 } }),
+      onlyPresetWith({ timer: { intervalMs: 150 } }),
     );
-    expect(durableConfig.timer.intervalMs).toBe(150);
+    expect(durableConfig.presets[0].timer.intervalMs).toBe(150);
     expect(result.current.saveError).toBeNull();
   });
 
@@ -327,7 +415,7 @@ describe("useConfig", () => {
     vi.useFakeTimers();
 
     act(() => {
-      result.current.updateConfig((current) => ({
+      result.current.updatePreset((current) => ({
         ...current,
         timer: { intervalMs: 125 },
       }));
@@ -341,7 +429,7 @@ describe("useConfig", () => {
     await act(async () => vi.advanceTimersByTimeAsync(250));
 
     expect(api.saveConfig).toHaveBeenCalledTimes(2);
-    expect(durableConfig.timer.intervalMs).toBe(125);
+    expect(durableConfig.presets[0].timer.intervalMs).toBe(125);
     expect(result.current.saveError).toBeNull();
   });
 
@@ -354,7 +442,7 @@ describe("useConfig", () => {
     vi.useFakeTimers();
 
     act(() => {
-      result.current.updateConfig((current) => ({
+      result.current.updatePreset((current) => ({
         ...current,
         timer: { intervalMs: 125 },
       }));
@@ -378,7 +466,7 @@ describe("useConfig", () => {
     vi.useFakeTimers();
 
     act(() => {
-      result.current.updateConfig((current) => ({
+      result.current.updatePreset((current) => ({
         ...current,
         timer: { intervalMs: 125 },
       }));
@@ -402,14 +490,14 @@ describe("useConfig", () => {
     vi.useFakeTimers();
 
     act(() => {
-      result.current.updateConfig((current) => ({
+      result.current.updatePreset((current) => ({
         ...current,
         timer: { intervalMs: 125 },
       }));
     });
     await act(async () => vi.advanceTimersByTimeAsync(250));
     act(() => {
-      result.current.updateConfig((current) => ({
+      result.current.updatePreset((current) => ({
         ...current,
         timer: { intervalMs: 150 },
       }));

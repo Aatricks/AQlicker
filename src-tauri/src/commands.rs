@@ -11,8 +11,8 @@ use serde::Serialize;
 use tauri::{Emitter, Manager};
 
 use crate::{
-    AppConfig, ConfigRepository, ConfigRepositoryError, RecoveryNotice, RunController, RunError,
-    RunSnapshot, RunStatus, StartOutcome,
+    AppConfig, ConfigRepository, ConfigRepositoryError, Preset, RecoveryNotice, RunController,
+    RunError, RunSnapshot, RunStatus, StartOutcome,
     focus::{RunningApp, system_focus_probe},
     permission::{PermissionProvider, PermissionStatus},
     shortcuts::{ShortcutAction, ShortcutController, ShortcutError},
@@ -61,7 +61,7 @@ pub type RuntimeObserver = Arc<dyn Fn(u64, u64, RunSnapshot) + Send + Sync>;
 
 pub trait RuntimeService: Send + Sync {
     fn set_observer(&mut self, observer: RuntimeObserver);
-    fn start(&self, config: AppConfig) -> Result<StartOutcome, CommandError>;
+    fn start(&self, preset: Preset) -> Result<StartOutcome, CommandError>;
     fn stop(&self) -> bool;
     fn snapshot(&self) -> RunSnapshot;
     fn shutdown(&self, timeout: Duration) -> Result<(u64, u64, RunSnapshot), CommandError>;
@@ -72,8 +72,8 @@ impl RuntimeService for RunController {
         RunController::set_tagged_observer(self, observer);
     }
 
-    fn start(&self, config: AppConfig) -> Result<StartOutcome, CommandError> {
-        RunController::start(self, config).map_err(|error| CommandError::new(error.code))
+    fn start(&self, preset: Preset) -> Result<StartOutcome, CommandError> {
+        RunController::start(self, preset).map_err(|error| CommandError::new(error.code))
     }
 
     fn stop(&self) -> bool {
@@ -130,7 +130,7 @@ impl RuntimeService for DesktopRuntime {
         *lock(&self.observer) = observer;
     }
 
-    fn start(&self, config: AppConfig) -> Result<StartOutcome, CommandError> {
+    fn start(&self, preset: Preset) -> Result<StartOutcome, CommandError> {
         let mut controller = lock(&self.controller);
         if controller.is_none() {
             let mut created =
@@ -141,7 +141,7 @@ impl RuntimeService for DesktopRuntime {
         controller
             .as_ref()
             .unwrap()
-            .start(config)
+            .start(preset)
             .map_err(|error| CommandError::new(error.code))
     }
 
@@ -489,6 +489,11 @@ impl ServiceCore {
         if !config.validate_for_start().is_empty() {
             return Err(CommandError::new("invalid-config"));
         }
+        // A run always uses the active preset. `validate_for_start` already
+        // rejects an unresolvable one, so this is the same rejection twice.
+        let Some(preset) = config.active_preset().cloned() else {
+            return Err(CommandError::new("invalid-config"));
+        };
         if !self.permission.status().granted {
             return Err(CommandError::new("permission-required"));
         }
@@ -505,7 +510,7 @@ impl ServiceCore {
         }
 
         let was_active = self.active_generation.is_some();
-        match self.runtime.start(config.clone()) {
+        match self.runtime.start(preset) {
             Ok(StartOutcome::Started { generation }) => {
                 self.active_generation = Some(generation);
                 self.current_config = Some(config);
@@ -1339,6 +1344,66 @@ mod tests {
     }
 
     #[test]
+    fn start_runs_the_active_preset_not_the_first_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let starts = Arc::new(Mutex::new(0));
+        let started_configs = Arc::new(Mutex::new(Vec::new()));
+        let service = AppService::new(
+            ConfigRepository::new(directory.path()),
+            Box::new(FakePermission { granted: true }),
+            Box::new(FakeShortcuts::available()),
+            Box::new(FakeRuntime::with_controls(
+                Arc::clone(&starts),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::clone(&started_configs),
+            )),
+            Arc::new(RecordingEmitter::default()),
+        );
+        let active = Preset {
+            id: "second".to_owned(),
+            name: "Second".to_owned(),
+            keys: vec![KeyEntry::new(LogicalKey::KeyB)],
+            mode: crate::Mode::Natural,
+            ..Preset::default()
+        };
+        let config = AppConfig {
+            active_preset_id: "second".to_owned(),
+            presets: vec![
+                Preset {
+                    keys: vec![KeyEntry::new(LogicalKey::KeyA)],
+                    ..Preset::default()
+                },
+                active.clone(),
+            ],
+            ..AppConfig::default()
+        };
+
+        assert_eq!(service.start(config).unwrap().status, RunStatus::Running);
+
+        assert_eq!(started_configs.lock().unwrap().as_slice(), &[active]);
+        service.shutdown().unwrap();
+    }
+
+    #[test]
+    fn start_refuses_a_configuration_whose_active_preset_is_unresolvable() {
+        let directory = tempfile::tempdir().unwrap();
+        let starts = Arc::new(Mutex::new(0));
+        let service = test_service(
+            directory.path(),
+            Box::new(FakePermission { granted: true }),
+            Arc::clone(&starts),
+        );
+        let config = AppConfig {
+            active_preset_id: "missing".to_owned(),
+            ..valid_config()
+        };
+
+        assert_eq!(service.start(config).unwrap_err().code, "invalid-config");
+        assert_eq!(*starts.lock().unwrap(), 0);
+        service.shutdown().unwrap();
+    }
+
+    #[test]
     fn save_and_start_share_one_ordered_configuration_boundary() {
         let directory = tempfile::tempdir().unwrap();
         let replace_entered = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1376,7 +1441,10 @@ mod tests {
 
         saving.join().unwrap().unwrap();
         assert_eq!(starting.join().unwrap().unwrap().status, RunStatus::Running);
-        assert_eq!(started_configs.lock().unwrap().as_slice(), &[config]);
+        assert_eq!(
+            started_configs.lock().unwrap().as_slice(),
+            &[config.active_preset().unwrap().clone()]
+        );
         service.shutdown().unwrap();
     }
 
@@ -1512,8 +1580,11 @@ mod tests {
 
     fn valid_config() -> AppConfig {
         AppConfig {
-            keys: vec![KeyEntry::new(LogicalKey::KeyA)],
-            stop_after: Some(1),
+            presets: vec![Preset {
+                keys: vec![KeyEntry::new(LogicalKey::KeyA)],
+                stop_after: Some(1),
+                ..Preset::default()
+            }],
             ..AppConfig::default()
         }
     }
@@ -1685,7 +1756,7 @@ mod tests {
             *self.observer.lock().unwrap() = observer;
         }
 
-        fn start(&self, config: AppConfig) -> Result<StartOutcome, CommandError> {
+        fn start(&self, config: Preset) -> Result<StartOutcome, CommandError> {
             if self.snapshot.lock().unwrap().status != RunStatus::Idle {
                 return Ok(StartOutcome::BusyRunning);
             }
@@ -1787,7 +1858,7 @@ mod tests {
             *self.observer.lock().unwrap() = observer;
         }
 
-        fn start(&self, config: AppConfig) -> Result<StartOutcome, CommandError> {
+        fn start(&self, config: Preset) -> Result<StartOutcome, CommandError> {
             if self.terminal_pending.load(Ordering::SeqCst) {
                 return Ok(StartOutcome::TerminalPending);
             }
@@ -1888,7 +1959,7 @@ mod tests {
             *self.observer.lock().unwrap() = observer;
         }
 
-        fn start(&self, config: AppConfig) -> Result<StartOutcome, CommandError> {
+        fn start(&self, config: Preset) -> Result<StartOutcome, CommandError> {
             let current = self.generation.load(Ordering::SeqCst);
             if current == 1 && !self.finished.load(Ordering::SeqCst) {
                 return Ok(StartOutcome::TerminalPending);
@@ -1957,7 +2028,7 @@ mod tests {
         observer: Mutex<RuntimeObserver>,
         starts: Arc<Mutex<usize>>,
         start_failures: Arc<AtomicUsize>,
-        started_configs: Arc<Mutex<Vec<AppConfig>>>,
+        started_configs: Arc<Mutex<Vec<Preset>>>,
         generation: AtomicUsize,
         revision: AtomicUsize,
     }
@@ -1978,7 +2049,7 @@ mod tests {
         fn with_controls(
             starts: Arc<Mutex<usize>>,
             start_failures: Arc<AtomicUsize>,
-            started_configs: Arc<Mutex<Vec<AppConfig>>>,
+            started_configs: Arc<Mutex<Vec<Preset>>>,
         ) -> Self {
             Self {
                 snapshot: Mutex::new(RunSnapshot::idle()),
@@ -2008,7 +2079,7 @@ mod tests {
             *self.observer.lock().unwrap() = observer;
         }
 
-        fn start(&self, config: AppConfig) -> Result<StartOutcome, CommandError> {
+        fn start(&self, config: Preset) -> Result<StartOutcome, CommandError> {
             if self.snapshot.lock().unwrap().status != RunStatus::Idle {
                 return Ok(StartOutcome::BusyRunning);
             }

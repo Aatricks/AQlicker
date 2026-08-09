@@ -1,11 +1,11 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { DEFAULT_CONFIG, type AppConfig } from "../domain/config";
+import { DEFAULT_PRESET, type Preset } from "../domain/config";
 import { ModeControls } from "./ModeControls";
 
-function naturalConfig(): AppConfig {
+function naturalConfig(): Preset {
   return {
-    ...DEFAULT_CONFIG,
+    ...DEFAULT_PRESET,
     keys: [{ key: "KeyA", weight: 1, cooldownMs: 0 }],
     mode: "natural",
     natural: {
@@ -23,7 +23,7 @@ function naturalConfig(): AppConfig {
 describe("ModeControls", () => {
   it("shows only the 40-60,000 ms interval in Timer mode", () => {
     const onChange = vi.fn();
-    render(<ModeControls config={DEFAULT_CONFIG} onChange={onChange} />);
+    render(<ModeControls config={DEFAULT_PRESET} onChange={onChange} />);
 
     const interval = screen.getByRole("spinbutton", {
       name: "Timer interval (ms)",
@@ -34,7 +34,7 @@ describe("ModeControls", () => {
 
     fireEvent.change(interval, { target: { value: "240" } });
     expect(onChange).toHaveBeenLastCalledWith({
-      ...DEFAULT_CONFIG,
+      ...DEFAULT_PRESET,
       timer: { intervalMs: 240 },
     });
   });
@@ -130,7 +130,7 @@ describe("ModeControls", () => {
   it("associates a mode field error with the invalid input", () => {
     render(
       <ModeControls
-        config={DEFAULT_CONFIG}
+        config={DEFAULT_PRESET}
         onChange={vi.fn()}
         errors={{
           "timer.intervalMs": "Choose an interval from 40 to 60,000 ms",

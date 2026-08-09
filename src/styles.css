@@ -129,6 +129,7 @@ summary:focus-visible,
 
 input[type="number"],
 input[type="search"],
+input[type="text"],
 .target-app-field select {
   min-height: 40px;
   width: 100%;
@@ -144,6 +145,7 @@ input[type="search"],
 
 input[type="number"]:focus,
 input[type="search"]:focus,
+input[type="text"]:focus,
 .target-app-field select:focus {
   background: var(--surface);
 }
@@ -470,6 +472,31 @@ ul {
   border-color: var(--line);
   background: var(--surface);
   color: var(--ink);
+}
+
+.preset-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.preset-actions button {
+  flex: 1 1 auto;
+  min-height: 34px;
+  padding-inline: 0.5rem;
+  font-size: 0.76rem;
+  font-weight: 500;
+}
+
+.preset-rename {
+  display: grid;
+  gap: 8px;
+}
+
+.section-note {
+  color: var(--ink-faint);
+  font-size: 0.76rem;
+  line-height: 1.45;
 }
 
 .duration-fields {

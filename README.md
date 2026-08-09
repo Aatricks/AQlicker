@@ -25,6 +25,16 @@ pnpm tauri dev
 
 Builds are unsigned and not notarized. macOS Gatekeeper will complain, and Windows SmartScreen will warn.
 
+## Presets
+
+Settings live in named presets. A preset holds the key list with its weights and cooldowns, the mode, the timer interval, the natural settings including the advanced overrides, the automatic stop, and the target application. The global shortcut is not part of a preset; it is a single app-level setting, so switching presets does not change how a run is started or stopped.
+
+One preset is active at a time, and Start uses it. Edits save into the active preset as you make them, the same way settings have always saved. There is no Save button.
+
+The preset control at the top of the panel selects the active preset and creates, duplicates, renames and deletes presets. A name is trimmed, cannot be empty, and is limited to 60 characters. Two presets may share a name. There is always at least one preset, so deleting the last one is refused. While a run is active the whole configuration is locked, including switching and editing presets.
+
+Configuration files written by an earlier version are read as a single preset named "Default".
+
 ## Modes
 
 **Timer** walks the key list in order at a fixed interval, from 40 ms to 60 s.
@@ -51,7 +61,7 @@ On macOS this reads the frontmost window through `CGWindowListCopyWindowInfo`, w
 
 ## Configuration
 
-Settings save automatically to a local file and reload on launch. A run never resumes by itself. If the file is unreadable, AQlicker keeps it as a backup and starts from defaults rather than overwriting it.
+Settings save automatically to a local file and reload on launch. The file holds every preset, which one is active, and the global shortcut. A run never resumes by itself. If the file is unreadable, AQlicker keeps it as a backup and starts from defaults rather than overwriting it.
 
 ## Testing input
 

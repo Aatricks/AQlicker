@@ -1,9 +1,9 @@
-import type { AppConfig, NaturalOverrides } from "../domain/config";
+import type { NaturalOverrides, Preset } from "../domain/config";
 import type { FieldErrors } from "../domain/validation";
 
 interface ModeControlsProps {
-  config: AppConfig;
-  onChange: (config: AppConfig) => void;
+  config: Preset;
+  onChange: (preset: Preset) => void;
   disabled?: boolean;
   errors?: FieldErrors;
 }

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 
 use crate::{
-    AppConfig, LogicalKey, Mode, TargetApp,
+    LogicalKey, Mode, Preset, TargetApp,
     focus::{FocusProbe, UnknownFocus, system_focus_probe},
     input::{EnigoInputSink, InputFailure, InputSink},
     scheduler::{
@@ -282,7 +282,7 @@ impl RunController {
         controller
     }
 
-    pub fn start(&self, request: AppConfig) -> Result<StartOutcome, StartError> {
+    pub fn start(&self, request: Preset) -> Result<StartOutcome, StartError> {
         {
             let state = lock(&self.shared.state);
             match state.snapshot.status {
@@ -863,7 +863,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{AppConfig, KeyEntry, LogicalKey, Mode, TargetApp};
+    use crate::{KeyEntry, LogicalKey, Mode, Preset, TargetApp};
 
     #[derive(Clone)]
     struct BlockingSink {
@@ -1888,8 +1888,8 @@ mod tests {
         }
     }
 
-    fn targeted_request(mode: Mode) -> AppConfig {
-        AppConfig {
+    fn targeted_request(mode: Mode) -> Preset {
+        Preset {
             target_app: Some(TargetApp {
                 id: "com.apple.TextEdit".to_owned(),
                 name: "TextEdit".to_owned(),
@@ -2111,8 +2111,8 @@ mod tests {
 
     /// Natural mode with fixed 100 ms intervals, so a cooldown test reads the
     /// worker's waiting instead of the sampler's variation.
-    fn cooling_request(cooldown_ms: u32, stop_after: u32) -> AppConfig {
-        AppConfig {
+    fn cooling_request(cooldown_ms: u32, stop_after: u32) -> Preset {
+        Preset {
             keys: vec![KeyEntry {
                 key: LogicalKey::KeyA,
                 weight: 1,
@@ -2129,7 +2129,7 @@ mod tests {
                 }),
             },
             stop_after: Some(stop_after),
-            ..AppConfig::default()
+            ..Preset::default()
         }
     }
 
@@ -2153,7 +2153,7 @@ mod tests {
 
         // 30 polls x 200 ms = 6 s paused before the first press is emitted.
         controller
-            .start(AppConfig {
+            .start(Preset {
                 target_app: Some(TargetApp {
                     id: "com.apple.TextEdit".to_owned(),
                     name: "TextEdit".to_owned(),
@@ -2405,7 +2405,7 @@ mod tests {
         // is spent by 4 s, so the third press waits only the cooldown, not a
         // fresh one measured from the resume.
         controller
-            .start(AppConfig {
+            .start(Preset {
                 target_app: Some(TargetApp {
                     id: "com.apple.TextEdit".to_owned(),
                     name: "TextEdit".to_owned(),
@@ -2429,12 +2429,12 @@ mod tests {
         assert_eq!(snapshot.stop_reason, Some(StopReason::DurationComplete));
     }
 
-    fn test_request(mode: Mode) -> AppConfig {
-        AppConfig {
+    fn test_request(mode: Mode) -> Preset {
+        Preset {
             keys: vec![KeyEntry::new(LogicalKey::KeyA)],
             mode,
             stop_after: Some(1),
-            ..AppConfig::default()
+            ..Preset::default()
         }
     }
 

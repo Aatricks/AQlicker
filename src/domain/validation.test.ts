@@ -1,12 +1,31 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_CONFIG, type AppConfig } from "./config";
+import {
+  DEFAULT_CONFIG,
+  DEFAULT_PRESET,
+  MAX_PRESET_NAME_LENGTH,
+  type AppConfig,
+  type Preset,
+} from "./config";
 import { validateConfig, validateConfigForStart } from "./validation";
 
-function configWith(overrides: Partial<AppConfig>): AppConfig {
+/**
+ * Only the active preset is on screen, so its messages stay unprefixed. The
+ * inactive preset at index 0 is here to prove nothing leaks in from it.
+ */
+function configWith(overrides: Partial<Preset>): AppConfig {
   return {
     ...DEFAULT_CONFIG,
-    keys: [{ key: "KeyA", weight: 1, cooldownMs: 0 }],
-    ...overrides,
+    activePresetId: "second",
+    presets: [
+      { ...DEFAULT_PRESET, id: "first", name: "First" },
+      {
+        ...DEFAULT_PRESET,
+        id: "second",
+        name: "Second",
+        keys: [{ key: "KeyA", weight: 1, cooldownMs: 0 }],
+        ...overrides,
+      },
+    ],
   };
 }
 
@@ -35,6 +54,37 @@ describe("configuration draft validation", () => {
     expect(validateConfigForStart(DEFAULT_CONFIG)).toMatchObject({
       keys: "Choose at least one key",
     });
+    expect(validateConfig(configWith({ keys: [] }))).toEqual({});
+    expect(validateConfigForStart(configWith({ keys: [] }))).toMatchObject({
+      keys: "Choose at least one key",
+    });
+  });
+
+  it("reports a bad name for every preset, not only the active one", () => {
+    const inactiveIsUnnamed: AppConfig = {
+      ...configWith({}),
+      presets: configWith({}).presets.map((preset, index) =>
+        index === 0 ? { ...preset, name: "  " } : preset,
+      ),
+    };
+
+    // Otherwise the save gate blocks on an error no control is showing.
+    expect(validateConfig(inactiveIsUnnamed)).toEqual({
+      "presets[0].name": "Name the preset",
+    });
+    expect(validateConfig(configWith({ name: "  " }))).toEqual({
+      name: "Name the preset",
+      "presets[1].name": "Name the preset",
+    });
+    expect(
+      validateConfig(configWith({ name: "n".repeat(MAX_PRESET_NAME_LENGTH + 1) })),
+    ).toMatchObject({ name: "Keep the name to 60 characters" });
+  });
+
+  it("reports an unresolvable active preset instead of validating nothing", () => {
+    expect(
+      validateConfig({ ...configWith({}), activePresetId: "missing" }),
+    ).toEqual({ activePresetId: "Choose a preset" });
   });
 
   it("accepts the inclusive timer and automatic-stop boundaries", () => {

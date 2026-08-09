@@ -6,7 +6,7 @@ import type {
   PermissionStatus,
   RunSnapshot,
 } from "./api/aqlicker";
-import { DEFAULT_CONFIG, type AppConfig } from "./domain/config";
+import { DEFAULT_CONFIG, DEFAULT_PRESET, type AppConfig } from "./domain/config";
 import { IDLE_SNAPSHOT } from "./hooks/useRunState";
 import App from "./App";
 
@@ -59,9 +59,14 @@ function fakeApi(overrides: Partial<BootstrapPayload> = {}) {
 function naturalConfig(): AppConfig {
   return {
     ...DEFAULT_CONFIG,
-    keys: [{ key: "Space", weight: 3, cooldownMs: 0 }],
-    mode: "natural",
-    stopAfter: 3_600,
+    presets: [
+      {
+        ...DEFAULT_PRESET,
+        keys: [{ key: "Space", weight: 3, cooldownMs: 0 }],
+        mode: "natural",
+        stopAfter: 3_600,
+      },
+    ],
   };
 }
 
@@ -110,8 +115,17 @@ describe("App", () => {
     render(
       <App
         api={
-          fakeApi({ config: { ...DEFAULT_CONFIG, keys: [{ key: "Space", weight: 3, cooldownMs: 0 }] } })
-            .api
+          fakeApi({
+            config: {
+              ...DEFAULT_CONFIG,
+              presets: [
+                {
+                  ...DEFAULT_PRESET,
+                  keys: [{ key: "Space", weight: 3, cooldownMs: 0 }],
+                },
+              ],
+            },
+          }).api
         }
       />,
     );
@@ -127,6 +141,62 @@ describe("App", () => {
     expect(
       screen.getByRole("heading", { name: "Global shortcut" }),
     ).toBeVisible();
+  });
+
+  it("edits and switches presets, and locks the preset control during a run", async () => {
+    const config: AppConfig = {
+      ...DEFAULT_CONFIG,
+      activePresetId: "first",
+      presets: [
+        {
+          ...DEFAULT_PRESET,
+          id: "first",
+          name: "First",
+          keys: [{ key: "KeyA", weight: 1, cooldownMs: 0 }],
+          timer: { intervalMs: 111 },
+        },
+        {
+          ...DEFAULT_PRESET,
+          id: "second",
+          name: "Second",
+          keys: [{ key: "Space", weight: 1, cooldownMs: 0 }],
+          timer: { intervalMs: 222 },
+        },
+      ],
+    };
+    const { api, emit } = fakeApi({ config });
+    render(<App api={api} />);
+
+    const select = await screen.findByRole("combobox", {
+      name: /Active preset/,
+    });
+    expect(
+      screen.getByRole("spinbutton", { name: "Timer interval (ms)" }),
+    ).toHaveValue(111);
+
+    fireEvent.change(select, { target: { value: "second" } });
+    expect(
+      screen.getByRole("spinbutton", { name: "Timer interval (ms)" }),
+    ).toHaveValue(222);
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() =>
+      expect(api.startRun).toHaveBeenCalledWith({
+        ...config,
+        activePresetId: "second",
+      }),
+    );
+    emit(runningState({ mode: "timer" }));
+
+    expect(select).toBeDisabled();
+    for (const name of [
+      "New preset",
+      "Duplicate preset",
+      "Rename preset",
+      "Delete preset",
+    ]) {
+      expect(screen.getByRole("button", { name })).toBeDisabled();
+    }
   });
 
   it("announces Unavailable rather than Ready when bootstrap fails", async () => {

@@ -4,7 +4,7 @@ import {
   type AqlickerApi,
   type BootstrapPayload,
 } from "../api/aqlicker";
-import type { AppConfig } from "../domain/config";
+import type { AppConfig, Preset } from "../domain/config";
 import {
   validateConfig,
   validateConfigForStart,
@@ -142,6 +142,23 @@ export function useConfig(api: AqlickerApi = aqlickerApi) {
     });
   }, []);
 
+  /**
+   * Every preset edit rewrites the whole document, so a switch that lands while
+   * a save is in flight cannot write one preset's contents into another's slot:
+   * the queued value is always a complete, self-consistent document.
+   */
+  const updatePreset = useCallback(
+    (updater: (preset: Preset) => Preset) => {
+      updateConfig((current) => ({
+        ...current,
+        presets: current.presets.map((preset) =>
+          preset.id === current.activePresetId ? updater(preset) : preset,
+        ),
+      }));
+    },
+    [updateConfig],
+  );
+
   const registerShortcut = useCallback(
     async (candidate: string) => {
       const registered = await api.setShortcut(candidate);
@@ -165,6 +182,7 @@ export function useConfig(api: AqlickerApi = aqlickerApi) {
     loadError,
     saveError,
     updateConfig,
+    updatePreset,
     registerShortcut,
   };
 }

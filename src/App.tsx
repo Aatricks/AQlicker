@@ -8,10 +8,12 @@ import { ErrorNotice } from "./components/ErrorNotice";
 import { KeySequenceEditor } from "./components/KeySequenceEditor";
 import { ModeControls } from "./components/ModeControls";
 import { PermissionBanner } from "./components/PermissionBanner";
+import { PresetControls } from "./components/PresetControls";
 import { RunControls } from "./components/RunControls";
 import { ShortcutRecorder } from "./components/ShortcutRecorder";
 import { StopAfterControls } from "./components/StopAfterControls";
 import { TargetAppPicker } from "./components/TargetAppPicker";
+import { activePreset } from "./domain/config";
 import { useConfig } from "./hooks/useConfig";
 import { useRunState } from "./hooks/useRunState";
 
@@ -34,6 +36,7 @@ function App({ api = aqlickerApi }: AppProps) {
     loadError,
     saveError,
     updateConfig,
+    updatePreset,
     registerShortcut,
   } = useConfig(api);
   const run = useRunState(api, bootstrap?.run);
@@ -113,6 +116,8 @@ function App({ api = aqlickerApi }: AppProps) {
         ? "Unavailable"
         : "Ready";
 
+  const preset = config ? activePreset(config) : null;
+
   const blockers = config
     ? Array.from(
         new Set([
@@ -166,39 +171,45 @@ function App({ api = aqlickerApi }: AppProps) {
           />
         )}
 
-        {config && (
+        {config && preset && (
           <div className="configuration-stack">
-            <KeySequenceEditor
-              disabled={locked}
-              error={startErrors.keys}
-              errors={errors}
-              mode={config.mode}
-              onChange={(keys) =>
-                updateConfig((current) => ({ ...current, keys }))
-              }
-              value={config.keys}
-            />
-            <ModeControls
+            <PresetControls
               config={config}
               disabled={locked}
               errors={errors}
               onChange={updateConfig}
             />
+            <KeySequenceEditor
+              disabled={locked}
+              error={startErrors.keys}
+              errors={errors}
+              mode={preset.mode}
+              onChange={(keys) =>
+                updatePreset((current) => ({ ...current, keys }))
+              }
+              value={preset.keys}
+            />
+            <ModeControls
+              config={preset}
+              disabled={locked}
+              errors={errors}
+              onChange={(next) => updatePreset(() => next)}
+            />
             <TargetAppPicker
               disabled={locked}
               listApps={listApps}
               onChange={(targetApp) =>
-                updateConfig((current) => ({ ...current, targetApp }))
+                updatePreset((current) => ({ ...current, targetApp }))
               }
-              value={config.targetApp}
+              value={preset.targetApp}
             />
             <StopAfterControls
               disabled={locked}
               error={errors.stopAfter}
               onChange={(stopAfter) =>
-                updateConfig((current) => ({ ...current, stopAfter }))
+                updatePreset((current) => ({ ...current, stopAfter }))
               }
-              value={config.stopAfter}
+              value={preset.stopAfter}
             />
             <ShortcutRecorder
               disabled={locked}

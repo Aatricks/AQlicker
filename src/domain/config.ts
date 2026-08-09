@@ -28,16 +28,25 @@ export interface TargetApp {
   name: string;
 }
 
-export interface AppConfig {
-  schemaVersion: 3;
+export interface Preset {
+  /** Opaque, generated in the webview. Identity lives here, not in the name. */
+  id: string;
+  name: string;
   /** `cooldownMs` is Natural mode only: 0 disables the cooldown. */
   keys: Array<{ key: LogicalKey; weight: number; cooldownMs: number }>;
   mode: Mode;
   timer: { intervalMs: number };
   natural: { naturalness: number; advanced: NaturalOverrides | null };
   stopAfter: number | null;
-  globalShortcut: string;
   targetApp: TargetApp | null;
+}
+
+export interface AppConfig {
+  schemaVersion: 4;
+  /** App-level, never per-preset, so switching presets never changes it. */
+  globalShortcut: string;
+  activePresetId: string;
+  presets: Preset[];
 }
 
 export interface ValidationError {
@@ -45,22 +54,47 @@ export interface ValidationError {
   code: string;
 }
 
-export const DEFAULT_CONFIG: AppConfig = {
-  schemaVersion: 3,
+export const DEFAULT_PRESET_ID = "default";
+export const DEFAULT_PRESET_NAME = "Default";
+export const MAX_PRESET_NAME_LENGTH = 60;
+
+export const DEFAULT_PRESET: Preset = {
+  id: DEFAULT_PRESET_ID,
+  name: DEFAULT_PRESET_NAME,
   keys: [],
   mode: "timer",
   timer: { intervalMs: 100 },
   natural: { naturalness: 50, advanced: null },
   stopAfter: null,
-  globalShortcut: "CommandOrControl+Shift+K",
   targetApp: null,
 };
 
-export function validateConfig(config: AppConfig): ValidationError[] {
+export const DEFAULT_CONFIG: AppConfig = {
+  schemaVersion: 4,
+  globalShortcut: "CommandOrControl+Shift+K",
+  activePresetId: DEFAULT_PRESET_ID,
+  presets: [DEFAULT_PRESET],
+};
+
+export function activePreset(config: AppConfig): Preset | null {
+  return (
+    config.presets.find((preset) => preset.id === config.activePresetId) ?? null
+  );
+}
+
+/** Field paths are relative to the preset; `validateConfig` prefixes them. */
+export function validatePreset(preset: Preset): ValidationError[] {
   const errors: ValidationError[] = [];
 
+  if (preset.name.trim() === "") {
+    errors.push({ field: "name", code: "required" });
+  }
+  if ([...preset.name.trim()].length > MAX_PRESET_NAME_LENGTH) {
+    errors.push({ field: "name", code: "range" });
+  }
+
   const seen = new Set<LogicalKey>();
-  for (const entry of config.keys) {
+  for (const entry of preset.keys) {
     if (seen.has(entry.key)) {
       errors.push({ field: "keys", code: "duplicate" });
       break;
@@ -68,7 +102,7 @@ export function validateConfig(config: AppConfig): ValidationError[] {
     seen.add(entry.key);
   }
 
-  config.keys.forEach((entry, index) => {
+  preset.keys.forEach((entry, index) => {
     if (!Number.isInteger(entry.weight) || entry.weight < 1 || entry.weight > 10) {
       errors.push({ field: `keys[${index}].weight`, code: "range" });
     }
@@ -77,15 +111,15 @@ export function validateConfig(config: AppConfig): ValidationError[] {
     }
   });
 
-  if (!Number.isInteger(config.timer.intervalMs) || config.timer.intervalMs < 40 || config.timer.intervalMs > 60_000) {
+  if (!Number.isInteger(preset.timer.intervalMs) || preset.timer.intervalMs < 40 || preset.timer.intervalMs > 60_000) {
     errors.push({ field: "timer.intervalMs", code: "range" });
   }
 
-  if (!Number.isInteger(config.natural.naturalness) || config.natural.naturalness < 0 || config.natural.naturalness > 100) {
+  if (!Number.isInteger(preset.natural.naturalness) || preset.natural.naturalness < 0 || preset.natural.naturalness > 100) {
     errors.push({ field: "natural.naturalness", code: "range" });
   }
 
-  const advanced = config.natural.advanced;
+  const advanced = preset.natural.advanced;
   if (advanced) {
     if (!Number.isInteger(advanced.minIntervalMs) || advanced.minIntervalMs < 40 || advanced.minIntervalMs > 5_000) {
       errors.push({ field: "natural.advanced.minIntervalMs", code: "range" });
@@ -104,12 +138,44 @@ export function validateConfig(config: AppConfig): ValidationError[] {
     }
   }
 
-  if (config.stopAfter !== null && (!Number.isInteger(config.stopAfter) || config.stopAfter < 1 || config.stopAfter > 86_400)) {
+  if (preset.stopAfter !== null && (!Number.isInteger(preset.stopAfter) || preset.stopAfter < 1 || preset.stopAfter > 86_400)) {
     errors.push({ field: "stopAfter", code: "range" });
   }
 
-  if (config.targetApp !== null && config.targetApp.id.trim() === "") {
+  if (preset.targetApp !== null && preset.targetApp.id.trim() === "") {
     errors.push({ field: "targetApp.id", code: "required" });
+  }
+
+  return errors;
+}
+
+export function validateConfig(config: AppConfig): ValidationError[] {
+  const errors: ValidationError[] = [];
+
+  if (config.presets.length === 0) {
+    errors.push({ field: "presets", code: "required" });
+  }
+
+  const seen = new Set<string>();
+  for (const preset of config.presets) {
+    if (seen.has(preset.id)) {
+      errors.push({ field: "presets", code: "duplicate" });
+      break;
+    }
+    seen.add(preset.id);
+  }
+
+  config.presets.forEach((preset, index) => {
+    if (preset.id.trim() === "") {
+      errors.push({ field: `presets[${index}].id`, code: "required" });
+    }
+    for (const error of validatePreset(preset)) {
+      errors.push({ field: `presets[${index}].${error.field}`, code: error.code });
+    }
+  });
+
+  if (activePreset(config) === null) {
+    errors.push({ field: "activePresetId", code: "unknown" });
   }
 
   return errors;
@@ -117,8 +183,11 @@ export function validateConfig(config: AppConfig): ValidationError[] {
 
 export function validateConfigForStart(config: AppConfig): ValidationError[] {
   const errors = validateConfig(config);
-  if (config.keys.length === 0) {
-    errors.push({ field: "keys", code: "required" });
+  const index = config.presets.findIndex(
+    (preset) => preset.id === config.activePresetId,
+  );
+  if (index >= 0 && config.presets[index].keys.length === 0) {
+    errors.push({ field: `presets[${index}].keys`, code: "required" });
   }
   return errors;
 }

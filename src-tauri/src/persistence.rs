@@ -9,7 +9,7 @@ use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{AppConfig, CURRENT_SCHEMA_VERSION};
+use crate::config::{AppConfig, CURRENT_SCHEMA_VERSION, DEFAULT_PRESET_ID, DEFAULT_PRESET_NAME};
 
 const CONFIG_FILE_NAME: &str = "config.json";
 
@@ -125,6 +125,28 @@ pub fn migrate_to_current(document: Value) -> Result<AppConfig, ConfigRepository
         }
     }
 
+    // v3 kept one unnamed configuration at the top level. It migrates to v4 as a
+    // single preset named "Default", with the global shortcut lifted out because
+    // it is app-level and must survive every preset switch. A body that is not a
+    // JSON object falls through to `InvalidConfig`, which keeps the corrupt-file
+    // backup path in charge of it.
+    if document.get("schemaVersion").and_then(Value::as_u64) == Some(3) {
+        let Some(object) = document.as_object_mut() else {
+            return Err(ConfigRepositoryError::InvalidConfig);
+        };
+        let global_shortcut = object.remove("globalShortcut").unwrap_or(Value::Null);
+        object.remove("schemaVersion");
+        let mut preset = document;
+        preset["id"] = Value::from(DEFAULT_PRESET_ID);
+        preset["name"] = Value::from(DEFAULT_PRESET_NAME);
+        document = serde_json::json!({
+            "schemaVersion": 4,
+            "globalShortcut": global_shortcut,
+            "activePresetId": DEFAULT_PRESET_ID,
+            "presets": [preset],
+        });
+    }
+
     let schema_version = document
         .get("schemaVersion")
         .and_then(Value::as_u64)
@@ -196,15 +218,32 @@ impl From<serde_json::Error> for ConfigRepositoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::KeyEntry;
+    use crate::config::{KeyEntry, Preset};
     use crate::key::LogicalKey;
+
+    fn write_fixture(directory: &Path, body: &str) -> PathBuf {
+        let path = directory.join(CONFIG_FILE_NAME);
+        fs::write(&path, body).unwrap();
+        path
+    }
 
     #[test]
     fn persistence_saves_and_loads_atomically() {
         let directory = tempfile::tempdir().unwrap();
         let repository = ConfigRepository::new(directory.path());
         let config = AppConfig {
-            keys: vec![KeyEntry::new(LogicalKey::KeyA)],
+            presets: vec![
+                Preset {
+                    keys: vec![KeyEntry::new(LogicalKey::KeyA)],
+                    ..Preset::default()
+                },
+                Preset {
+                    id: "second".to_owned(),
+                    name: "Second".to_owned(),
+                    ..Preset::default()
+                },
+            ],
+            active_preset_id: "second".to_owned(),
             ..AppConfig::default()
         };
 
@@ -214,68 +253,139 @@ mod tests {
     }
 
     #[test]
-    fn migration_loads_a_v1_file_with_the_target_application_disabled() {
+    fn migration_loads_a_v1_file_as_a_single_default_preset() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(CONFIG_FILE_NAME);
-        fs::write(&path, include_str!("../tests/fixtures/config-v1.json")).unwrap();
+        write_fixture(
+            directory.path(),
+            include_str!("../tests/fixtures/config-v1.json"),
+        );
 
         let loaded = ConfigRepository::new(directory.path()).load().unwrap();
 
         assert!(loaded.notice.is_none());
         assert_eq!(loaded.config.schema_version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(loaded.config.target_app, None);
-        assert_eq!(loaded.config.natural.naturalness, 65);
-        assert_eq!(loaded.config.stop_after, Some(3_600));
-        assert!(
-            loaded
-                .config
-                .keys
-                .iter()
-                .all(|entry| entry.cooldown_ms == 0)
-        );
+        assert_eq!(loaded.config.global_shortcut, "CommandOrControl+Shift+K");
+        assert_eq!(loaded.config.presets.len(), 1);
+        assert_eq!(loaded.config.active_preset_id, DEFAULT_PRESET_ID);
+        let preset = loaded.config.active_preset().unwrap();
+        assert_eq!(preset.id, DEFAULT_PRESET_ID);
+        assert_eq!(preset.name, DEFAULT_PRESET_NAME);
+        assert_eq!(preset.target_app, None);
+        assert_eq!(preset.natural.naturalness, 65);
+        assert_eq!(preset.stop_after, Some(3_600));
+        assert!(preset.keys.iter().all(|entry| entry.cooldown_ms == 0));
     }
 
     #[test]
-    fn migration_loads_a_v2_file_with_every_cooldown_disabled() {
+    fn migration_loads_a_v2_file_as_a_single_default_preset() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(CONFIG_FILE_NAME);
-        fs::write(&path, include_str!("../tests/fixtures/config-v2.json")).unwrap();
+        write_fixture(
+            directory.path(),
+            include_str!("../tests/fixtures/config-v2.json"),
+        );
 
         let loaded = ConfigRepository::new(directory.path()).load().unwrap();
 
         assert!(loaded.notice.is_none());
         assert_eq!(loaded.config.schema_version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(loaded.config.keys.len(), 6);
-        assert!(
-            loaded
-                .config
-                .keys
-                .iter()
-                .all(|entry| entry.cooldown_ms == 0)
-        );
+        assert_eq!(loaded.config.presets.len(), 1);
+        assert_eq!(loaded.config.active_preset_id, DEFAULT_PRESET_ID);
+        let preset = loaded.config.active_preset().unwrap();
+        assert_eq!(preset.name, DEFAULT_PRESET_NAME);
+        assert_eq!(preset.keys.len(), 6);
+        assert!(preset.keys.iter().all(|entry| entry.cooldown_ms == 0));
         assert_eq!(
-            loaded.config.target_app.as_ref().map(|app| app.id.as_str()),
+            preset.target_app.as_ref().map(|app| app.id.as_str()),
             Some("com.apple.TextEdit")
         );
     }
 
     #[test]
-    fn migration_leaves_a_corrupt_v2_file_to_the_backup_path() {
+    fn migration_loads_a_v3_file_as_a_single_default_preset() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(CONFIG_FILE_NAME);
-        fs::write(&path, r#"{"schemaVersion":2,"keys":"not-an-array"}"#).unwrap();
+        write_fixture(
+            directory.path(),
+            include_str!("../tests/fixtures/config-v3.json"),
+        );
 
         let loaded = ConfigRepository::new(directory.path()).load().unwrap();
 
-        assert_eq!(loaded.notice.unwrap().code, "corrupt-config-recovered");
-        assert!(!path.exists());
+        assert!(loaded.notice.is_none());
+        assert_eq!(loaded.config.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(loaded.config.global_shortcut, "CommandOrControl+Shift+K");
+        assert_eq!(loaded.config.presets.len(), 1);
+        assert_eq!(loaded.config.active_preset_id, DEFAULT_PRESET_ID);
+        let preset = loaded.config.active_preset().unwrap();
+        assert_eq!(preset.id, DEFAULT_PRESET_ID);
+        assert_eq!(preset.name, DEFAULT_PRESET_NAME);
+        assert_eq!(preset.keys.len(), 6);
+        assert_eq!(preset.keys[1].cooldown_ms, 250);
+        assert_eq!(preset.timer.interval_ms, 120);
+        assert_eq!(preset.stop_after, Some(3_600));
+        assert_eq!(
+            preset.target_app.as_ref().map(|app| app.id.as_str()),
+            Some("com.apple.TextEdit")
+        );
+    }
+
+    #[test]
+    fn migration_loads_a_v4_file_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        write_fixture(
+            directory.path(),
+            include_str!("../tests/fixtures/config-v4.json"),
+        );
+
+        let loaded = ConfigRepository::new(directory.path()).load().unwrap();
+
+        assert!(loaded.notice.is_none());
+        assert_eq!(loaded.config.presets.len(), 2);
+        assert_eq!(loaded.config.active_preset_id, "preset-grinding");
+        assert_eq!(loaded.config.active_preset().unwrap().name, "Grinding");
+    }
+
+    #[test]
+    fn migration_leaves_a_corrupt_file_to_the_backup_path() {
+        for body in [
+            r#"{"schemaVersion":2,"keys":"not-an-array"}"#,
+            r#"{"schemaVersion":3,"keys":"not-an-array"}"#,
+            r#"{"schemaVersion":3,"keys":[],"mode":"timer","timer":{"intervalMs":100},"natural":{"naturalness":50,"advanced":null},"stopAfter":null}"#,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = write_fixture(directory.path(), body);
+
+            let loaded = ConfigRepository::new(directory.path()).load().unwrap();
+
+            assert_eq!(
+                loaded.notice.unwrap().code,
+                "corrupt-config-recovered",
+                "{body} was accepted"
+            );
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn load_rejects_a_v4_file_whose_active_preset_is_unresolvable() {
+        for body in [
+            r#"{"schemaVersion":4,"globalShortcut":"CommandOrControl+Shift+K","activePresetId":"missing","presets":[{"id":"default","name":"Default","keys":[],"mode":"timer","timer":{"intervalMs":100},"natural":{"naturalness":50,"advanced":null},"stopAfter":null,"targetApp":null}]}"#,
+            r#"{"schemaVersion":4,"globalShortcut":"CommandOrControl+Shift+K","activePresetId":"default","presets":[]}"#,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = write_fixture(directory.path(), body);
+
+            let loaded = ConfigRepository::new(directory.path()).load().unwrap();
+
+            assert_eq!(loaded.notice.unwrap().code, "corrupt-config-recovered");
+            assert_eq!(loaded.config, AppConfig::default());
+            assert!(!path.exists());
+        }
     }
 
     #[test]
     fn persistence_rejects_future_schema_without_replacing_the_file() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(CONFIG_FILE_NAME);
-        fs::write(&path, r#"{"schemaVersion":4}"#).unwrap();
+        let path = write_fixture(directory.path(), r#"{"schemaVersion":5}"#);
 
         let error = ConfigRepository::new(directory.path()).load().unwrap_err();
 
