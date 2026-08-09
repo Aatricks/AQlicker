@@ -73,7 +73,7 @@ describe("ModeControls", () => {
 
   it("creates a complete advanced override set when a field changes", () => {
     const onChange = vi.fn();
-    const config: AppConfig = {
+    const config: Preset = {
       ...naturalConfig(),
       natural: { naturalness: 50, advanced: null },
     };
@@ -105,7 +105,7 @@ describe("ModeControls", () => {
   ])(
     "derives Advanced defaults from Naturalness %i using scheduler interpolation",
     (naturalness, minimum, maximum, burst, pause) => {
-      const config: AppConfig = {
+      const config: Preset = {
         ...naturalConfig(),
         natural: { naturalness, advanced: null },
       };

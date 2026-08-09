@@ -8,13 +8,13 @@ import {
 } from "react";
 import {
   LOGICAL_KEYS,
-  type AppConfig,
+  type Preset,
   type LogicalKey,
   type Mode,
 } from "../domain/config";
 import type { FieldErrors } from "../domain/validation";
 
-type KeyEntry = AppConfig["keys"][number];
+type KeyEntry = Preset["keys"][number];
 
 interface KeySequenceEditorProps {
   value: KeyEntry[];

@@ -1,9 +1,9 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import type { AppConfig } from "../domain/config";
+import type { Preset } from "../domain/config";
 import { KeySequenceEditor } from "./KeySequenceEditor";
 
-type KeyEntry = AppConfig["keys"][number];
+type KeyEntry = Preset["keys"][number];
 
 const entry = (
   key: KeyEntry["key"],
