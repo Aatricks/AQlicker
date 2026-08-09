@@ -19,11 +19,12 @@ function presetNameError(name: string) {
   return null;
 }
 
-/**
- * Field paths are unprefixed because only the active preset is on screen. The
- * one exception is the per-preset name, which is reported for every preset so
- * the save gate can never block on an error no control is showing.
- */
+function presetLabel(preset: Preset, index: number) {
+  const name = preset.name.trim();
+  return name === "" ? `Preset ${index + 1}` : `Preset "${name}"`;
+}
+
+/** Field paths are relative to the preset; `validateConfig` prefixes them. */
 function validatePreset(preset: Preset): FieldErrors {
   const errors: FieldErrors = {};
 
@@ -83,21 +84,57 @@ function validatePreset(preset: Preset): FieldErrors {
     errors.stopAfter = "Choose a duration from 1 second to 24 hours";
   }
 
+  if (preset.targetApp !== null && preset.targetApp.id.trim() === "") {
+    errors["targetApp.id"] = "Choose a target application or none";
+  }
+
   return errors;
 }
 
+/**
+ * Covers exactly what `AppConfig::validate` rejects in Rust. Anything it misses
+ * would pass this gate, be refused by the backend, and strand every later edit
+ * in React state with nothing on screen to fix.
+ *
+ * The active preset's messages stay unprefixed because its controls are on
+ * screen. Every other preset's messages are prefixed and name the preset, since
+ * the field they belong to is not visible.
+ */
 export function validateConfig(config: AppConfig): FieldErrors {
-  const active = activePreset(config);
-  const errors: FieldErrors = active ? validatePreset(active) : {};
+  const errors: FieldErrors = {};
 
-  if (!active) {
-    errors.activePresetId = "Choose a preset";
+  if (config.presets.length === 0) {
+    errors.presets = "Keep at least one preset";
+  }
+
+  const seen = new Set<string>();
+  for (const preset of config.presets) {
+    if (seen.has(preset.id)) {
+      errors.presets = "Two presets share an identifier";
+      break;
+    }
+    seen.add(preset.id);
   }
 
   config.presets.forEach((preset, index) => {
-    const name = presetNameError(preset.name);
-    if (name) errors[`presets[${index}].name`] = name;
+    if (preset.id.trim() === "") {
+      errors[`presets[${index}].id`] =
+        `${presetLabel(preset, index)}: has no identifier`;
+    }
+    const isActive = preset.id === config.activePresetId;
+    for (const [field, message] of Object.entries(validatePreset(preset))) {
+      if (isActive) {
+        errors[field] = message;
+      } else {
+        errors[`presets[${index}].${field}`] =
+          `${presetLabel(preset, index)}: ${message}`;
+      }
+    }
   });
+
+  if (activePreset(config) === null) {
+    errors.activePresetId = "Choose a preset";
+  }
 
   return errors;
 }

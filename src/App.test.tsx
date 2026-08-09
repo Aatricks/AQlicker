@@ -199,6 +199,47 @@ describe("App", () => {
     }
   });
 
+  it("blocks Start and names the preset when a preset off screen is invalid", async () => {
+    const config: AppConfig = {
+      ...DEFAULT_CONFIG,
+      activePresetId: "second",
+      presets: [
+        {
+          ...DEFAULT_PRESET,
+          id: "first",
+          name: "First",
+          keys: [{ key: "KeyA", weight: 1, cooldownMs: 0 }],
+          timer: { intervalMs: 39 },
+        },
+        {
+          ...DEFAULT_PRESET,
+          id: "second",
+          name: "Second",
+          keys: [{ key: "Space", weight: 1, cooldownMs: 0 }],
+        },
+      ],
+    };
+    const { api } = fakeApi({ config });
+    render(<App api={api} />);
+
+    // Start must not offer to run a document the backend will reject.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Start" })).toBeDisabled(),
+    );
+    expect(
+      screen.getByText(
+        'Preset "First": Choose an interval from 40 to 60,000 ms',
+      ),
+    ).toBeInTheDocument();
+
+    // And it must never be saved either: Rust would reject it and the draft
+    // would be stranded in React state.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    });
+    expect(api.saveConfig).not.toHaveBeenCalled();
+  });
+
   it("announces Unavailable rather than Ready when bootstrap fails", async () => {
     const { api } = fakeApi();
     vi.mocked(api.bootstrap).mockRejectedValueOnce(new Error("offline"));

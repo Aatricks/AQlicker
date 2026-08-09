@@ -1,7 +1,12 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AqlickerApi, BootstrapPayload } from "../api/aqlicker";
-import { DEFAULT_CONFIG, DEFAULT_PRESET, type Preset } from "../domain/config";
+import {
+  DEFAULT_CONFIG,
+  DEFAULT_PRESET,
+  type AppConfig,
+  type Preset,
+} from "../domain/config";
 import { useConfig } from "./useConfig";
 
 function bootstrap(): BootstrapPayload {
@@ -184,6 +189,83 @@ describe("useConfig", () => {
     expect(api.saveConfig).toHaveBeenLastCalledWith(expected);
     expect(durableConfig).toEqual(expected);
   });
+
+  it.each([
+    [
+      "deleting",
+      (config: AppConfig): AppConfig => ({
+        ...config,
+        activePresetId: "second",
+        presets: config.presets.filter(({ id }) => id !== "first"),
+      }),
+    ],
+    [
+      "renaming",
+      (config: AppConfig): AppConfig => ({
+        ...config,
+        presets: config.presets.map((preset) =>
+          preset.id === "second" ? { ...preset, name: "Renamed" } : preset,
+        ),
+      }),
+    ],
+  ])(
+    "keeps the document whole when %s a preset lands mid-save",
+    async (_label, mutate) => {
+      const payload = bootstrap();
+      payload.config = {
+        ...payload.config,
+        activePresetId: "first",
+        presets: [
+          { ...DEFAULT_PRESET, id: "first", name: "First" },
+          { ...DEFAULT_PRESET, id: "second", name: "Second" },
+        ],
+      };
+      const firstSave = deferred<void>();
+      let durableConfig = payload.config;
+      const api = fakeApi(payload);
+      vi.mocked(api.saveConfig)
+        .mockImplementationOnce(async (candidate) => {
+          await firstSave.promise;
+          durableConfig = candidate;
+        })
+        .mockImplementation(async (candidate) => {
+          durableConfig = candidate;
+        });
+      const { result } = renderHook(() => useConfig(api));
+      await waitFor(() => expect(result.current.config).not.toBeNull());
+      vi.useFakeTimers();
+
+      act(() => {
+        result.current.updatePreset((current) => ({
+          ...current,
+          timer: { intervalMs: 111 },
+        }));
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(250));
+      expect(api.saveConfig).toHaveBeenCalledTimes(1);
+
+      // The structural change lands while that save is still outstanding.
+      act(() => {
+        result.current.updateConfig(mutate);
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(250));
+      await act(async () => {
+        firstSave.resolve();
+        await firstSave.promise;
+      });
+
+      const expected = mutate({
+        ...payload.config,
+        presets: payload.config.presets.map((preset) =>
+          preset.id === "first"
+            ? { ...preset, timer: { intervalMs: 111 } }
+            : preset,
+        ),
+      });
+      expect(api.saveConfig).toHaveBeenLastCalledWith(expected);
+      expect(durableConfig).toEqual(expected);
+    },
+  );
 
   it("cancels a pending save when the hook unmounts", async () => {
     const api = fakeApi();

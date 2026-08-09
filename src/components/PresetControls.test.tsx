@@ -102,6 +102,42 @@ describe("PresetControls", () => {
     expect(validateConfig(next)).toEqual([]);
   });
 
+  it.each([50, 54, 55, 56, 59, 60])(
+    "duplicates a %i-character name without spinning, twice over",
+    (length) => {
+      const onChange = vi.fn();
+      const name = "n".repeat(length);
+      let config: AppConfig = {
+        ...DEFAULT_CONFIG,
+        activePresetId: "source",
+        presets: [{ ...DEFAULT_PRESET, id: "source", name }],
+      };
+      const { rerender } = render(
+        <PresetControls config={config} disabled={false} onChange={onChange} />,
+      );
+
+      // Twice: the second copy is where a name-uniquifying loop runs out of
+      // distinct candidates once truncation eats the suffix.
+      for (let round = 0; round < 2; round += 1) {
+        fireEvent.click(screen.getByRole("button", { name: "Duplicate preset" }));
+        config = onChange.mock.lastCall![0] as AppConfig;
+        rerender(
+          <PresetControls config={config} disabled={false} onChange={onChange} />,
+        );
+      }
+
+      expect(config.presets).toHaveLength(3);
+      expect(validateConfig(config)).toEqual([]);
+      for (const preset of config.presets) {
+        expect(preset.name).toBe(preset.name.trim());
+        expect([...preset.name].length).toBeLessThanOrEqual(
+          MAX_PRESET_NAME_LENGTH,
+        );
+      }
+      expect(new Set(config.presets.map(({ id }) => id)).size).toBe(3);
+    },
+  );
+
   it("renames the active preset, trimming and refusing an empty name", () => {
     const onChange = vi.fn();
     const config = twoPresets();

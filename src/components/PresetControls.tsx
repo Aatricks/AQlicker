@@ -15,18 +15,9 @@ interface PresetControlsProps {
 
 const DELETE_LAST_REASON = "The last preset cannot be deleted.";
 
+/** Trims after slicing too: the cut can land on a space and reintroduce one. */
 function trimToLimit(name: string) {
-  return [...name.trim()].slice(0, MAX_PRESET_NAME_LENGTH).join("");
-}
-
-function copyOf(preset: Preset, presets: Preset[]) {
-  const taken = new Set(presets.map(({ name }) => name));
-  const base = trimToLimit(`${preset.name} copy`);
-  if (!taken.has(base)) return base;
-  for (let suffix = 2; ; suffix += 1) {
-    const candidate = trimToLimit(`${preset.name} copy ${suffix}`);
-    if (!taken.has(candidate)) return candidate;
-  }
+  return [...name.trim()].slice(0, MAX_PRESET_NAME_LENGTH).join("").trim();
 }
 
 /**
@@ -95,7 +86,7 @@ export function PresetControls({
     add({
       ...structuredClone(active),
       id: crypto.randomUUID(),
-      name: copyOf(active, config.presets),
+      name: trimToLimit(`${active.name} copy`),
     });
   };
 
@@ -171,8 +162,10 @@ export function PresetControls({
           <label className="target-app-field">
             <span>Preset name</span>
             <input
-              aria-describedby={nameError ? "preset-name-error" : undefined}
-              aria-invalid={nameError ? "true" : undefined}
+              aria-describedby={
+                (nameError ?? storedNameError) ? "preset-name-error" : undefined
+              }
+              aria-invalid={(nameError ?? storedNameError) ? "true" : undefined}
               autoFocus
               disabled={disabled}
               maxLength={MAX_PRESET_NAME_LENGTH}
