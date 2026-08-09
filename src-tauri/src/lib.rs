@@ -15,6 +15,7 @@ pub mod persistence;
 pub mod run;
 pub mod scheduler;
 pub mod shortcuts;
+pub mod tray;
 
 pub use commands::{
     AppService, BootstrapPayload, CommandError, DesktopRuntime, RunEventEmitter,
@@ -43,10 +44,13 @@ pub fn run() {
     let shutdown_complete = Arc::new(AtomicBool::new(false));
     let close_started = Arc::clone(&shutdown_started);
     let close_complete = Arc::clone(&shutdown_complete);
+    let tray_started = Arc::clone(&shutdown_started);
+    let tray_complete = Arc::clone(&shutdown_complete);
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .setup(|app| {
+        .setup(move |app| {
             let app_handle = app.handle().clone();
+            build_tray(app.handle(), &tray_started, &tray_complete)?;
             let shortcut_app = app_handle.clone();
             let registry = shortcuts::TauriShortcutRegistry::new(
                 app_handle.clone(),
@@ -74,6 +78,7 @@ pub fn run() {
             commands::request_access,
             commands::permission_status,
             commands::set_shortcut,
+            commands::set_cycle_shortcut,
             commands::list_apps,
         ])
         .on_window_event(move |window, event| {
@@ -103,6 +108,52 @@ pub fn run() {
             }
         }
     });
+}
+
+/// Every handler here runs on the main thread, which the service dispatcher
+/// needs in order to register global shortcuts. So each one only enqueues work
+/// or spawns a thread and returns: none of them ever waits for a reply.
+fn build_tray(
+    app: &tauri::AppHandle,
+    started: &Arc<AtomicBool>,
+    complete: &Arc<AtomicBool>,
+) -> tauri::Result<()> {
+    let started = Arc::clone(started);
+    let complete = Arc::clone(complete);
+    let menu = tray::build_menu(app, &tray::tray_model(None, false))?;
+    tauri::tray::TrayIconBuilder::with_id(tray::TRAY_ID)
+        // Alpha-only, so macOS tints it for a light or a dark menu bar.
+        .icon(tauri::image::Image::from_bytes(include_bytes!(
+            "../icons/tray-template.png"
+        ))?)
+        .icon_as_template(true)
+        .tooltip("AQlicker")
+        .menu(&menu)
+        .on_menu_event(move |app, event| {
+            let id = event.id().as_ref();
+            if id == tray::QUIT_ITEM_ID {
+                request_shutdown(app.clone(), Arc::clone(&started), Arc::clone(&complete));
+                return;
+            }
+            if id == tray::SHOW_ITEM_ID {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+                return;
+            }
+            let Some(service) = app.try_state::<AppService>() else {
+                return;
+            };
+            if id == tray::RUN_ITEM_ID {
+                let _ = service.enqueue_shortcut(ShortcutAction::ToggleRun);
+            } else if let Some(preset_id) = tray::preset_id_from_item(id) {
+                let _ = service.enqueue_select_preset(preset_id.to_owned());
+            }
+        })
+        .build(app)?;
+    Ok(())
 }
 
 fn request_shutdown(app: tauri::AppHandle, started: Arc<AtomicBool>, complete: Arc<AtomicBool>) {

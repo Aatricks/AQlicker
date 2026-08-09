@@ -20,12 +20,15 @@ function fakeApi(overrides: Partial<BootstrapPayload> = {}) {
       registered: true,
       error: null,
     },
+    cycleShortcut: null,
     run: IDLE_SNAPSHOT,
     ...overrides,
   };
 
   const handlers: Array<(state: RunSnapshot) => void> = [];
+  const configHandlers: Array<(config: AppConfig) => void> = [];
   const unlisten = vi.fn();
+  const unlistenConfig = vi.fn();
   const api = {
     bootstrap: vi.fn(async () => payload),
     saveConfig: vi.fn(async () => undefined),
@@ -41,18 +44,26 @@ function fakeApi(overrides: Partial<BootstrapPayload> = {}) {
       async (): Promise<PermissionStatus> => payload.permission,
     ),
     setShortcut: vi.fn(async (shortcut: string) => shortcut),
+    setCycleShortcut: vi.fn(async (shortcut: string | null) => shortcut),
     listApps: vi.fn(async () => [{ id: "com.apple.TextEdit", name: "TextEdit" }]),
     listenRunState: vi.fn(async (handler: (state: RunSnapshot) => void) => {
       handlers.push(handler);
       return unlisten;
+    }),
+    listenConfig: vi.fn(async (handler: (config: AppConfig) => void) => {
+      configHandlers.push(handler);
+      return unlistenConfig;
     }),
   } satisfies AqlickerApi;
 
   return {
     api,
     unlisten,
+    unlistenConfig,
     emit: (state: RunSnapshot) =>
       act(() => handlers.forEach((handler) => handler(state))),
+    emitConfig: (config: AppConfig) =>
+      act(() => configHandlers.forEach((handler) => handler(config))),
   };
 }
 
@@ -276,7 +287,7 @@ describe("App", () => {
     expect(screen.getByText("59:55 remaining")).toBeVisible();
     expect(screen.getByText("21 presses")).toBeVisible();
     expect(screen.getByRole("button", { name: "Add key" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Record shortcut" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Record global shortcut" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
   });
 
@@ -349,8 +360,99 @@ describe("App", () => {
     );
   });
 
+  it("warns when a stored cycling shortcut could not be registered", async () => {
+    const { api } = fakeApi({
+      config: {
+        ...DEFAULT_CONFIG,
+        presetCycleShortcut: "CommandOrControl+Alt+9",
+      },
+      cycleShortcut: {
+        shortcut: "CommandOrControl+Alt+9",
+        registered: false,
+        error: "shortcut-conflict",
+      },
+    });
+    render(<App api={api} />);
+    await screen.findByRole("heading", { name: "Preset cycling shortcut" });
+
+    expect(
+      screen.getByText(/another application already uses it/i),
+    ).toBeVisible();
+    // An unregistered cycling shortcut is optional, so it must not block Start.
+    expect(
+      screen.queryByText(/register the preset cycling shortcut/i),
+    ).toBeNull();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Record preset cycling shortcut" }),
+    );
+    fireEvent.keyDown(
+      screen.getByRole("button", { name: "Press preset cycling shortcut" }),
+      { code: "Digit8", key: "8", ctrlKey: true, altKey: true },
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.queryByText(/another application already uses it/i),
+      ).toBeNull(),
+    );
+  });
+
+  it("offers a separate recorder for the preset-cycling shortcut", async () => {
+    const { api } = fakeApi({
+      config: { ...DEFAULT_CONFIG, presetCycleShortcut: null },
+    });
+    render(<App api={api} />);
+    await screen.findByRole("heading", { name: "Preset cycling shortcut" });
+
+    expect(
+      screen.getByRole("button", { name: "Record global shortcut" }),
+    ).toBeVisible();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Record preset cycling shortcut" }),
+    );
+    fireEvent.keyDown(
+      screen.getByRole("button", { name: "Press preset cycling shortcut" }),
+      { code: "Digit1", key: "1", ctrlKey: true, altKey: true },
+    );
+
+    await waitFor(() =>
+      expect(api.setCycleShortcut).toHaveBeenCalledWith(
+        "CommandOrControl+Alt+1",
+      ),
+    );
+    // The global shortcut is untouched by the second recorder.
+    expect(api.setShortcut).not.toHaveBeenCalled();
+    await screen.findByText("CommandOrControl+Alt+1");
+  });
+
+  it("adopts a preset switch the backend made on its own", async () => {
+    const twoPresets: AppConfig = {
+      ...DEFAULT_CONFIG,
+      presets: [
+        { ...DEFAULT_PRESET, id: "first", name: "First" },
+        { ...DEFAULT_PRESET, id: "second", name: "Second" },
+      ],
+      activePresetId: "first",
+    };
+    const { api, emitConfig } = fakeApi({ config: twoPresets });
+    render(<App api={api} />);
+    await screen.findByRole("combobox", { name: "Active preset" });
+    expect(
+      screen.getByRole("combobox", { name: "Active preset" }),
+    ).toHaveValue("first");
+
+    emitConfig({ ...twoPresets, activePresetId: "second" });
+
+    expect(
+      screen.getByRole("combobox", { name: "Active preset" }),
+    ).toHaveValue("second");
+  });
+
   it("stops rechecking permission after unmount", async () => {
-    const { api, unlisten } = fakeApi({ config: naturalConfig() });
+    const { api, unlisten, unlistenConfig } = fakeApi({
+      config: naturalConfig(),
+    });
     const view = render(<App api={api} />);
     await screen.findByRole("button", { name: "Add key" });
 
@@ -358,6 +460,7 @@ describe("App", () => {
     fireEvent.focus(window);
     expect(api.permissionStatus).not.toHaveBeenCalled();
     expect(unlisten).toHaveBeenCalledTimes(1);
+    expect(unlistenConfig).toHaveBeenCalledTimes(1);
   });
 
   it("clears pending timers when the window unmounts", async () => {
@@ -385,8 +488,8 @@ describe("App", () => {
     render(<App api={api} />);
     await screen.findByRole("button", { name: "Add key" });
 
-    fireEvent.click(screen.getByRole("button", { name: "Record shortcut" }));
-    fireEvent.keyDown(screen.getByRole("button", { name: "Press shortcut" }), {
+    fireEvent.click(screen.getByRole("button", { name: "Record global shortcut" }));
+    fireEvent.keyDown(screen.getByRole("button", { name: "Press global shortcut" }), {
       code: "KeyJ",
       key: "j",
       metaKey: true,
@@ -416,8 +519,8 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Start" })).toBeDisabled();
     expect(screen.getByText("Register the global shortcut")).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "Record shortcut" }));
-    fireEvent.keyDown(screen.getByRole("button", { name: "Press shortcut" }), {
+    fireEvent.click(screen.getByRole("button", { name: "Record global shortcut" }));
+    fireEvent.keyDown(screen.getByRole("button", { name: "Press global shortcut" }), {
       code: "KeyJ",
       key: "j",
       metaKey: true,

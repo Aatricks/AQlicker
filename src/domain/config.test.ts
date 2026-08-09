@@ -1,7 +1,8 @@
 import fixtureV1 from "../../src-tauri/tests/fixtures/config-v1.json";
 import fixtureV2 from "../../src-tauri/tests/fixtures/config-v2.json";
 import fixtureV3 from "../../src-tauri/tests/fixtures/config-v3.json";
-import fixture from "../../src-tauri/tests/fixtures/config-v4.json";
+import fixtureV4 from "../../src-tauri/tests/fixtures/config-v4.json";
+import fixture from "../../src-tauri/tests/fixtures/config-v5.json";
 import logicalKeys from "../../src-tauri/tests/fixtures/logical-keys.json";
 import { describe, expect, it } from "vitest";
 import {
@@ -10,6 +11,7 @@ import {
   LOGICAL_KEYS,
   MAX_PRESET_NAME_LENGTH,
   activePreset,
+  nextPresetId,
   serializeConfig,
   validateConfig,
   validateConfigForStart,
@@ -55,12 +57,18 @@ describe("configuration contract", () => {
     expect(fixtureV3).toHaveProperty("globalShortcut");
   });
 
-  it("deserializes the v4 fixture with its exact camelCase schema", () => {
+  it("keeps the v4 fixture readable as the pre-cycling-shortcut schema", () => {
+    expect(fixtureV4.schemaVersion).toBe(4);
+    expect(fixtureV4).not.toHaveProperty("presetCycleShortcut");
+  });
+
+  it("deserializes the v5 fixture with its exact camelCase schema", () => {
     const config = fixture as AppConfig;
 
     expect(config).toEqual({
-      schemaVersion: 4,
+      schemaVersion: 5,
       globalShortcut: "CommandOrControl+Shift+K",
+      presetCycleShortcut: "CommandOrControl+Shift+P",
       activePresetId: "preset-grinding",
       presets: [
         {
@@ -104,6 +112,24 @@ describe("configuration contract", () => {
     expect(activePreset(config)?.name).toBe("Grinding");
     expect(validateConfig(config)).toEqual([]);
     expect(serializeConfig(config)).toBe(JSON.stringify(fixture));
+  });
+
+  it("cycles through the presets in order, wrapping around", () => {
+    const config = configWith({});
+    // Every position is asserted, so neither a hard-coded index nor an
+    // increment that forgets to wrap can pass.
+    expect(nextPresetId({ ...config, activePresetId: "first" })).toBe("second");
+    expect(nextPresetId({ ...config, activePresetId: "second" })).toBe("first");
+  });
+
+  it("refuses to cycle with one preset or an unknown active one", () => {
+    expect(nextPresetId(DEFAULT_CONFIG)).toBeNull();
+    expect(nextPresetId({ ...configWith({}), activePresetId: "gone" })).toBeNull();
+  });
+
+  it("leaves the cycling shortcut unassigned by default", () => {
+    expect(DEFAULT_CONFIG.presetCycleShortcut).toBeNull();
+    expect(DEFAULT_CONFIG.schemaVersion).toBe(5);
   });
 
   it("reports field-specific validation errors and start-only empty selection", () => {

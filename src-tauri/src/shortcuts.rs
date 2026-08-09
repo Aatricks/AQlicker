@@ -8,6 +8,9 @@ pub const ACTIVE_RUN_SHORTCUT: &str = "Escape";
 pub enum ShortcutAction {
     ToggleRun,
     StopRun,
+    /// Switches to the next preset, wrapping around. App-level, exactly like
+    /// the toggle: it is not stored inside a preset.
+    CyclePreset,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,8 +41,11 @@ pub trait ShortcutRegistry: Send {
 
 pub trait ShortcutController: Send {
     fn replace(&mut self, shortcut: &str) -> Result<String, ShortcutError>;
+    fn replace_cycle(&mut self, shortcut: Option<&str>) -> Result<(), ShortcutError>;
     fn active(&self) -> Option<&str>;
+    fn cycle(&self) -> Option<&str>;
     fn toggle_registered(&self) -> bool;
+    fn cycle_registered(&self) -> bool;
     fn unregister_toggle(&mut self) -> Result<(), ShortcutError>;
     fn register_escape(&mut self) -> Result<(), ShortcutError>;
     fn unregister_escape(&mut self) -> Result<(), ShortcutError>;
@@ -49,17 +55,22 @@ pub trait ShortcutController: Send {
 
 pub struct ShortcutManager<R: ShortcutRegistry> {
     registry: R,
-    active: Option<String>,
+    /// The two app-level accelerators, in `TOGGLE`/`CYCLE` order. They share one
+    /// registration and rollback path so a conflict behaves the same for both.
+    slots: [Option<String>; 2],
     escape_registered: bool,
 }
 
+const TOGGLE: usize = 0;
+const CYCLE: usize = 1;
+
 impl<R: ShortcutRegistry> ShortcutManager<R> {
     pub fn new(mut registry: R, shortcut: &str) -> Result<Self, ShortcutError> {
-        ensure_toggle_is_not_escape(shortcut)?;
+        ensure_not_reserved(shortcut)?;
         registry.register(shortcut, ShortcutAction::ToggleRun)?;
         Ok(Self {
             registry,
-            active: Some(shortcut.to_owned()),
+            slots: [Some(shortcut.to_owned()), None],
             escape_registered: false,
         })
     }
@@ -67,44 +78,69 @@ impl<R: ShortcutRegistry> ShortcutManager<R> {
     pub fn without_toggle(registry: R) -> Self {
         Self {
             registry,
-            active: None,
+            slots: [None, None],
             escape_registered: false,
         }
     }
 
-    pub fn replace(&mut self, shortcut: &str) -> Result<String, ShortcutError> {
-        ensure_toggle_is_not_escape(shortcut)?;
-        if self.active.as_deref() == Some(shortcut) && self.registry.is_registered(shortcut) {
-            return Ok(shortcut.to_owned());
+    /// Registers `shortcut` in `slot`, releasing whatever was there. A failure
+    /// puts the previous accelerator back and reports the error, so the caller
+    /// keeps the shortcut it already had.
+    fn assign(
+        &mut self,
+        slot: usize,
+        action: ShortcutAction,
+        shortcut: Option<&str>,
+    ) -> Result<(), ShortcutError> {
+        if let Some(shortcut) = shortcut {
+            ensure_not_reserved(shortcut)?;
+            // One accelerator cannot mean two things.
+            if self.slots[1 - slot].as_deref() == Some(shortcut) {
+                return Err(ShortcutError::new("shortcut-conflict"));
+            }
+        }
+        if self.slots[slot].as_deref() == shortcut
+            && shortcut.is_none_or(|shortcut| self.registry.is_registered(shortcut))
+        {
+            return Ok(());
         }
 
-        let previous = self.active.take();
+        let previous = self.slots[slot].take();
         if let Some(previous) = previous.as_deref() {
             if let Err(error) = self.registry.unregister(previous) {
-                self.active = Some(previous.to_owned());
+                self.slots[slot] = Some(previous.to_owned());
                 return Err(error);
             }
         }
 
-        match self.registry.register(shortcut, ShortcutAction::ToggleRun) {
+        let Some(shortcut) = shortcut else {
+            return Ok(());
+        };
+        match self.registry.register(shortcut, action) {
             Ok(()) => {
-                self.active = Some(shortcut.to_owned());
-                Ok(shortcut.to_owned())
+                self.slots[slot] = Some(shortcut.to_owned());
+                Ok(())
             }
             Err(error) => {
                 if let Some(previous) = previous {
-                    if self
-                        .registry
-                        .register(&previous, ShortcutAction::ToggleRun)
-                        .is_err()
-                    {
+                    if self.registry.register(&previous, action).is_err() {
                         return Err(ShortcutError::new("shortcut-rollback-failed"));
                     }
-                    self.active = Some(previous);
+                    self.slots[slot] = Some(previous);
                 }
                 Err(error)
             }
         }
+    }
+
+    pub fn replace(&mut self, shortcut: &str) -> Result<String, ShortcutError> {
+        self.assign(TOGGLE, ShortcutAction::ToggleRun, Some(shortcut))?;
+        Ok(shortcut.to_owned())
+    }
+
+    /// `None` clears the preset-cycling shortcut, which is where it starts.
+    pub fn replace_cycle(&mut self, shortcut: Option<&str>) -> Result<(), ShortcutError> {
+        self.assign(CYCLE, ShortcutAction::CyclePreset, shortcut)
     }
 
     pub fn register_escape(&mut self) -> Result<(), ShortcutError> {
@@ -118,13 +154,7 @@ impl<R: ShortcutRegistry> ShortcutManager<R> {
     }
 
     pub fn unregister_toggle(&mut self) -> Result<(), ShortcutError> {
-        if let Some(shortcut) = self.active.take() {
-            if let Err(error) = self.registry.unregister(&shortcut) {
-                self.active = Some(shortcut);
-                return Err(error);
-            }
-        }
-        Ok(())
+        self.assign(TOGGLE, ShortcutAction::ToggleRun, None)
     }
 
     pub fn unregister_escape(&mut self) -> Result<(), ShortcutError> {
@@ -137,17 +167,29 @@ impl<R: ShortcutRegistry> ShortcutManager<R> {
 
     pub fn unregister_all(&mut self) -> Result<(), ShortcutError> {
         self.registry.unregister_all()?;
-        self.active = None;
+        self.slots = [None, None];
         self.escape_registered = false;
         Ok(())
     }
 
     pub fn active(&self) -> Option<&str> {
-        self.active.as_deref()
+        self.slots[TOGGLE].as_deref()
+    }
+
+    pub fn cycle(&self) -> Option<&str> {
+        self.slots[CYCLE].as_deref()
     }
 
     pub fn toggle_registered(&self) -> bool {
-        self.active
+        self.registered(TOGGLE)
+    }
+
+    pub fn cycle_registered(&self) -> bool {
+        self.registered(CYCLE)
+    }
+
+    fn registered(&self, slot: usize) -> bool {
+        self.slots[slot]
             .as_deref()
             .is_some_and(|shortcut| self.registry.is_registered(shortcut))
     }
@@ -166,12 +208,24 @@ impl<R: ShortcutRegistry> ShortcutController for ShortcutManager<R> {
         ShortcutManager::replace(self, shortcut)
     }
 
+    fn replace_cycle(&mut self, shortcut: Option<&str>) -> Result<(), ShortcutError> {
+        ShortcutManager::replace_cycle(self, shortcut)
+    }
+
     fn active(&self) -> Option<&str> {
         ShortcutManager::active(self)
     }
 
+    fn cycle(&self) -> Option<&str> {
+        ShortcutManager::cycle(self)
+    }
+
     fn toggle_registered(&self) -> bool {
         ShortcutManager::toggle_registered(self)
+    }
+
+    fn cycle_registered(&self) -> bool {
+        ShortcutManager::cycle_registered(self)
     }
 
     fn unregister_toggle(&mut self) -> Result<(), ShortcutError> {
@@ -195,7 +249,7 @@ impl<R: ShortcutRegistry> ShortcutController for ShortcutManager<R> {
     }
 }
 
-fn ensure_toggle_is_not_escape(shortcut: &str) -> Result<(), ShortcutError> {
+fn ensure_not_reserved(shortcut: &str) -> Result<(), ShortcutError> {
     if shortcut.trim().eq_ignore_ascii_case(ACTIVE_RUN_SHORTCUT) {
         Err(ShortcutError::new("shortcut-reserved"))
     } else {
@@ -255,21 +309,25 @@ impl ShortcutRegistry for TauriShortcutRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use super::*;
 
     struct FakeShortcutRegistry {
-        registered: HashSet<String>,
+        registered: HashMap<String, ShortcutAction>,
         conflicts: HashSet<String>,
     }
 
     impl FakeShortcutRegistry {
         fn with_conflict(shortcut: &str) -> Self {
             Self {
-                registered: HashSet::new(),
+                registered: HashMap::new(),
                 conflicts: HashSet::from([shortcut.to_owned()]),
             }
+        }
+
+        fn action_for(&self, shortcut: &str) -> Option<ShortcutAction> {
+            self.registered.get(shortcut).copied()
         }
     }
 
@@ -277,12 +335,12 @@ mod tests {
         fn register(
             &mut self,
             shortcut: &str,
-            _action: ShortcutAction,
+            action: ShortcutAction,
         ) -> Result<(), ShortcutError> {
             if self.conflicts.contains(shortcut) {
                 Err(ShortcutError::new("shortcut-conflict"))
             } else {
-                self.registered.insert(shortcut.to_owned());
+                self.registered.insert(shortcut.to_owned(), action);
                 Ok(())
             }
         }
@@ -298,8 +356,104 @@ mod tests {
         }
 
         fn is_registered(&self, shortcut: &str) -> bool {
-            self.registered.contains(shortcut)
+            self.registered.contains_key(shortcut)
         }
+    }
+
+    impl FakeShortcutRegistry {
+        fn free() -> Self {
+            Self {
+                registered: HashMap::new(),
+                conflicts: HashSet::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn cycle_shortcut_conflict_keeps_the_previous_one_registered() {
+        let mut manager =
+            ShortcutManager::new(FakeShortcutRegistry::with_conflict("Alt+2"), "Alt+T").unwrap();
+        manager.replace_cycle(Some("Alt+1")).unwrap();
+
+        let error = manager.replace_cycle(Some("Alt+2")).unwrap_err();
+
+        assert_eq!(error.code, "shortcut-conflict");
+        assert_eq!(manager.cycle(), Some("Alt+1"));
+        assert!(manager.cycle_registered());
+        // The rollback must not disturb the other slot.
+        assert_eq!(manager.active(), Some("Alt+T"));
+        assert!(manager.toggle_registered());
+    }
+
+    #[test]
+    fn cycle_shortcut_clears_back_to_unassigned() {
+        let mut manager = ShortcutManager::new(FakeShortcutRegistry::free(), "Alt+T").unwrap();
+        manager.replace_cycle(Some("Alt+1")).unwrap();
+
+        manager.replace_cycle(None).unwrap();
+
+        assert_eq!(manager.cycle(), None);
+        assert!(!manager.cycle_registered());
+        assert!(!manager.registry().is_registered("Alt+1"));
+        assert!(manager.toggle_registered());
+    }
+
+    #[test]
+    fn the_two_app_shortcuts_cannot_share_one_accelerator() {
+        let mut manager = ShortcutManager::new(FakeShortcutRegistry::free(), "Alt+T").unwrap();
+
+        assert_eq!(
+            manager.replace_cycle(Some("Alt+T")).unwrap_err().code,
+            "shortcut-conflict"
+        );
+        assert_eq!(manager.cycle(), None);
+
+        manager.replace_cycle(Some("Alt+1")).unwrap();
+        assert_eq!(
+            manager.replace("Alt+1").unwrap_err().code,
+            "shortcut-conflict"
+        );
+        assert_eq!(manager.active(), Some("Alt+T"));
+        assert!(manager.toggle_registered());
+    }
+
+    #[test]
+    fn escape_stays_reserved_for_the_cycle_shortcut_too() {
+        let mut manager = ShortcutManager::new(FakeShortcutRegistry::free(), "Alt+T").unwrap();
+
+        assert_eq!(
+            manager.replace_cycle(Some("Escape")).unwrap_err().code,
+            "shortcut-reserved"
+        );
+        assert_eq!(manager.cycle(), None);
+    }
+
+    #[test]
+    fn unregister_all_releases_both_app_shortcuts() {
+        let mut manager = ShortcutManager::new(FakeShortcutRegistry::free(), "Alt+T").unwrap();
+        manager.replace_cycle(Some("Alt+1")).unwrap();
+
+        manager.unregister_all().unwrap();
+
+        assert_eq!(manager.active(), None);
+        assert_eq!(manager.cycle(), None);
+        assert!(!manager.registry().is_registered("Alt+1"));
+        assert!(!manager.registry().is_registered("Alt+T"));
+    }
+
+    #[test]
+    fn the_cycle_shortcut_reaches_the_handler_as_a_cycle_action() {
+        let mut manager = ShortcutManager::new(FakeShortcutRegistry::free(), "Alt+T").unwrap();
+        manager.replace_cycle(Some("Alt+1")).unwrap();
+
+        assert_eq!(
+            manager.registry().action_for("Alt+1"),
+            Some(ShortcutAction::CyclePreset)
+        );
+        assert_eq!(
+            manager.registry().action_for("Alt+T"),
+            Some(ShortcutAction::ToggleRun)
+        );
     }
 
     #[test]

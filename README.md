@@ -31,9 +31,17 @@ Settings live in named presets. A preset holds the key list with its weights and
 
 One preset is active at a time, and Start uses it. Edits save into the active preset as you make them, the same way settings have always saved. There is no Save button.
 
+A second, optional global shortcut switches to the next preset, wrapping around from the last back to the first. It starts unassigned, so upgrading never takes a hotkey you already use elsewhere; record one under **Preset cycling shortcut**, and clear it there again. With a single preset it does nothing. While a run is active it is refused, like every other configuration change.
+
 The preset control at the top of the panel selects the active preset and creates, duplicates, renames and deletes presets. A name is trimmed, cannot be empty, and is limited to 60 characters. Two presets may share a name. There is always at least one preset, so deleting the last one is refused. While a run is active the whole configuration is locked, including switching and editing presets.
 
 Configuration files written by an earlier version are read as a single preset named "Default".
+
+## Menu bar
+
+AQlicker puts an item in the macOS menu bar. Its menu starts or stops a run, lists the presets with the active one ticked, shows the window, and quits. The labels follow the application: the first entry reads Start or Stop, and the tick moves when the preset changes, however it changed. While a run is active the preset entries are greyed out, since the configuration is locked; Start/Stop and Quit stay available.
+
+Quitting from the menu goes through the same shutdown as closing the window: the run is cancelled, any held key released, and the shortcuts unregistered before the application exits. The menu bar item disappears with it.
 
 ## Modes
 
@@ -48,6 +56,7 @@ Both modes accept an optional stop-after duration, from 1 second to 24 hours.
 ## Stopping a run
 
 - The global shortcut, `Cmd/Ctrl+Shift+K` by default, toggles start and stop from any application.
+- Stop from the menu bar item, or quit from it.
 - `Escape` stops a run while one is active. It does nothing otherwise.
 - Closing the window cancels the run and releases any key still held.
 
@@ -61,7 +70,7 @@ On macOS this reads the frontmost window through `CGWindowListCopyWindowInfo`, w
 
 ## Configuration
 
-Settings save automatically to a local file and reload on launch. The file holds every preset, which one is active, and the global shortcut. A run never resumes by itself. If the file is unreadable, AQlicker keeps it as a backup and starts from defaults rather than overwriting it.
+Settings save automatically to a local file and reload on launch. The file holds every preset, which one is active, and the two app-level shortcuts. A run never resumes by itself. If the file is unreadable, AQlicker keeps it as a backup and starts from defaults rather than overwriting it.
 
 ## Testing input
 

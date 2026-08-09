@@ -1,5 +1,5 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AqlickerApi, BootstrapPayload } from "../api/aqlicker";
 import {
   DEFAULT_CONFIG,
@@ -27,6 +27,7 @@ function bootstrap(): BootstrapPayload {
       registered: true,
       error: null,
     },
+    cycleShortcut: null,
     run: {
       status: "idle",
       mode: null,
@@ -46,7 +47,19 @@ function fakeApi(payload = bootstrap()) {
     bootstrap: vi.fn(async () => payload),
     saveConfig: vi.fn(async () => undefined),
     setShortcut: vi.fn(async (shortcut: string) => shortcut),
+    setCycleShortcut: vi.fn(async (shortcut: string | null) => shortcut),
+    listenConfig: vi.fn(async (handler: (config: AppConfig) => void) => {
+      configHandlers.push(handler);
+      return () => undefined;
+    }),
   } as unknown as AqlickerApi;
+}
+
+/** Filled by whichever `fakeApi` the test under way created. */
+let configHandlers: Array<(config: AppConfig) => void> = [];
+
+function emitConfig(config: AppConfig) {
+  act(() => configHandlers.forEach((handler) => handler(config)));
 }
 
 /**
@@ -74,6 +87,10 @@ function deferred<T>() {
   });
   return { promise, resolve, reject };
 }
+
+beforeEach(() => {
+  configHandlers = [];
+});
 
 afterEach(() => {
   vi.useRealTimers();
@@ -301,6 +318,130 @@ describe("useConfig", () => {
     expect(api.saveConfig).toHaveBeenCalledWith(
       onlyPresetWith({ keys: [] }),
     );
+  });
+
+  it("keeps an unsaved edit when the backend switches preset underneath it", async () => {
+    const payload = bootstrap();
+    payload.config = {
+      ...payload.config,
+      presets: [
+        { ...DEFAULT_PRESET, id: "first", name: "First" },
+        { ...DEFAULT_PRESET, id: "second", name: "Second" },
+      ],
+      activePresetId: "first",
+    };
+    const durable = payload.config;
+    const api = fakeApi(payload);
+    const { result } = renderHook(() => useConfig(api));
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+
+    vi.useFakeTimers();
+    act(() => {
+      result.current.updatePreset((current) => ({
+        ...current,
+        name: "Renamed",
+      }));
+    });
+    // The cycle hotkey fires before the 250 ms debounce, so Rust saves and
+    // echoes the document it last knew, which predates the rename.
+    emitConfig({ ...durable, activePresetId: "second" });
+
+    expect(result.current.config?.activePresetId).toBe("second");
+    expect(result.current.config?.presets[0].name).toBe("Renamed");
+
+    // The merged draft differs from what is on disk, so it must be saved.
+    await act(async () => vi.advanceTimersByTimeAsync(300));
+    expect(api.saveConfig).toHaveBeenCalledTimes(1);
+    expect(api.saveConfig).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        activePresetId: "second",
+        presets: [
+          { ...DEFAULT_PRESET, id: "first", name: "Renamed" },
+          { ...DEFAULT_PRESET, id: "second", name: "Second" },
+        ],
+      }),
+    );
+  });
+
+  it("ignores a backend switch to a preset the draft has already deleted", async () => {
+    const payload = bootstrap();
+    payload.config = {
+      ...payload.config,
+      presets: [
+        { ...DEFAULT_PRESET, id: "first", name: "First" },
+        { ...DEFAULT_PRESET, id: "second", name: "Second" },
+      ],
+      activePresetId: "first",
+    };
+    const durable = payload.config;
+    const api = fakeApi(payload);
+    const { result } = renderHook(() => useConfig(api));
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+
+    act(() => {
+      result.current.updateConfig((current) => ({
+        ...current,
+        presets: current.presets.filter((preset) => preset.id !== "second"),
+      }));
+    });
+    emitConfig({ ...durable, activePresetId: "second" });
+
+    // Adopting it would strand the draft on an unresolvable preset, which no
+    // control on screen can fix.
+    expect(result.current.config?.activePresetId).toBe("first");
+    expect(result.current.errors.activePresetId).toBeUndefined();
+  });
+
+  it("adopts a backend change without writing it back when nothing is pending", async () => {
+    const payload = bootstrap();
+    payload.config = {
+      ...payload.config,
+      presets: [
+        { ...DEFAULT_PRESET, id: "first", name: "First" },
+        { ...DEFAULT_PRESET, id: "second", name: "Second" },
+      ],
+      activePresetId: "first",
+    };
+    const durable = payload.config;
+    const api = fakeApi(payload);
+    const { result } = renderHook(() => useConfig(api));
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+
+    vi.useFakeTimers();
+    emitConfig({
+      ...durable,
+      activePresetId: "second",
+      presetCycleShortcut: "CommandOrControl+Alt+9",
+    });
+
+    expect(result.current.config?.activePresetId).toBe("second");
+    expect(result.current.config?.presetCycleShortcut).toBe(
+      "CommandOrControl+Alt+9",
+    );
+    // The event carries the document Rust has already written, so the durable
+    // marker moves with it and the save queue stays quiet.
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    expect(api.saveConfig).not.toHaveBeenCalled();
+  });
+
+  it("stores and clears the preset-cycling shortcut", async () => {
+    const api = fakeApi();
+    const { result } = renderHook(() => useConfig(api));
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+
+    await act(async () => {
+      await result.current.registerCycleShortcut("CommandOrControl+Alt+P");
+    });
+    expect(api.setCycleShortcut).toHaveBeenCalledWith("CommandOrControl+Alt+P");
+    expect(result.current.config?.presetCycleShortcut).toBe(
+      "CommandOrControl+Alt+P",
+    );
+
+    await act(async () => {
+      await result.current.registerCycleShortcut(null);
+    });
+    expect(api.setCycleShortcut).toHaveBeenLastCalledWith(null);
+    expect(result.current.config?.presetCycleShortcut).toBeNull();
   });
 
   it("registers a shortcut first and retains the previous value on rejection", async () => {

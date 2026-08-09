@@ -20,12 +20,16 @@ fn supported_key_catalog_matches_the_exhaustive_golden_list() {
 }
 
 #[test]
-fn contract_deserializes_the_v4_fixture_with_camel_case_fields() {
-    let fixture = include_str!("fixtures/config-v4.json");
+fn contract_deserializes_the_v5_fixture_with_camel_case_fields() {
+    let fixture = include_str!("fixtures/config-v5.json");
     let config: AppConfig = serde_json::from_str(fixture).unwrap();
 
-    assert_eq!(config.schema_version, 4);
+    assert_eq!(config.schema_version, 5);
     assert_eq!(config.global_shortcut, "CommandOrControl+Shift+K");
+    assert_eq!(
+        config.preset_cycle_shortcut.as_deref(),
+        Some("CommandOrControl+Shift+P")
+    );
     assert_eq!(config.active_preset_id, "preset-grinding");
     assert_eq!(
         config.presets,
@@ -116,8 +120,11 @@ fn contract_migrates_every_earlier_fixture_to_one_default_preset() {
 
         let config = migrate_to_current(document).unwrap();
 
-        assert_eq!(config.schema_version, 4);
+        assert_eq!(config.schema_version, 5);
         assert_eq!(config.global_shortcut, "CommandOrControl+Shift+K");
+        // Upgrading never assigns a cycle shortcut: it would steal a hotkey the
+        // user may already be using in another application.
+        assert_eq!(config.preset_cycle_shortcut, None);
         assert_eq!(config.active_preset_id, DEFAULT_PRESET_ID);
         assert_eq!(config.presets.len(), 1);
         let preset = config.active_preset().unwrap();
@@ -159,6 +166,27 @@ fn contract_migrates_every_earlier_fixture_to_one_default_preset() {
             })
         );
     }
+}
+
+#[test]
+fn contract_migrates_a_v4_file_keeping_its_presets_and_no_cycle_shortcut() {
+    let document = serde_json::from_str(include_str!("fixtures/config-v4.json")).unwrap();
+
+    let config = migrate_to_current(document).unwrap();
+
+    assert_eq!(config.schema_version, 5);
+    assert_eq!(config.preset_cycle_shortcut, None);
+    assert_eq!(config.global_shortcut, "CommandOrControl+Shift+K");
+    assert_eq!(config.active_preset_id, "preset-grinding");
+    assert_eq!(
+        config
+            .presets
+            .iter()
+            .map(|preset| preset.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Default", "Grinding"]
+    );
+    assert!(config.validate().is_empty());
 }
 
 #[test]

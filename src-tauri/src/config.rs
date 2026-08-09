@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::key::LogicalKey;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 /// Identifier given to the single preset every pre-v4 file migrates to, and to
 /// the preset a fresh installation starts from.
 pub const DEFAULT_PRESET_ID: &str = "default";
@@ -163,6 +163,9 @@ pub struct AppConfig {
     /// App-level, never per-preset: switching presets must not change how a run
     /// is started and stopped.
     pub global_shortcut: String,
+    /// App-level too, and unassigned by default so upgrading never claims a
+    /// hotkey the user already uses elsewhere.
+    pub preset_cycle_shortcut: Option<String>,
     pub active_preset_id: String,
     pub presets: Vec<Preset>,
 }
@@ -172,6 +175,7 @@ impl Default for AppConfig {
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
             global_shortcut: "CommandOrControl+Shift+K".to_owned(),
+            preset_cycle_shortcut: None,
             active_preset_id: DEFAULT_PRESET_ID.to_owned(),
             presets: vec![Preset::default()],
         }
@@ -183,6 +187,17 @@ impl AppConfig {
         self.presets
             .iter()
             .find(|preset| preset.id == self.active_preset_id)
+    }
+
+    /// The preset one step after the active one, wrapping around. `None` when
+    /// the active preset is unresolvable or is the only one, which makes
+    /// cycling a no-op rather than an error.
+    pub fn next_preset_id(&self) -> Option<&str> {
+        let index = self.active_preset_index()?;
+        if self.presets.len() < 2 {
+            return None;
+        }
+        Some(&self.presets[(index + 1) % self.presets.len()].id)
     }
 
     fn active_preset_index(&self) -> Option<usize> {
@@ -556,6 +571,37 @@ mod tests {
                 .iter()
                 .any(|error| error.field == "presets[1].id" && error.code == "required")
         );
+    }
+
+    #[test]
+    fn cycling_walks_the_preset_order_and_wraps_around() {
+        let config = config_with(vec![preset("a"), preset("b"), preset("c")]);
+        // Every position is asserted, so neither a hard-coded index nor an
+        // increment that forgets to wrap can pass.
+        for (active, expected) in [("a", "b"), ("b", "c"), ("c", "a")] {
+            let config = AppConfig {
+                active_preset_id: active.to_owned(),
+                ..config.clone()
+            };
+            assert_eq!(config.next_preset_id(), Some(expected), "from {active}");
+        }
+    }
+
+    #[test]
+    fn cycling_is_a_no_op_with_one_preset_or_an_unknown_active_one() {
+        assert_eq!(config_with(vec![preset("only")]).next_preset_id(), None);
+
+        let unknown = AppConfig {
+            active_preset_id: "missing".to_owned(),
+            ..config_with(vec![preset("a"), preset("b")])
+        };
+        assert_eq!(unknown.next_preset_id(), None);
+    }
+
+    #[test]
+    fn default_config_leaves_the_cycle_shortcut_unassigned() {
+        assert_eq!(AppConfig::default().preset_cycle_shortcut, None);
+        assert_eq!(AppConfig::default().schema_version, 5);
     }
 
     #[test]

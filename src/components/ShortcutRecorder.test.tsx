@@ -15,8 +15,8 @@ describe("ShortcutRecorder", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Record shortcut" }));
-    const recorder = screen.getByRole("button", { name: "Press shortcut" });
+    fireEvent.click(screen.getByRole("button", { name: "Record global shortcut" }));
+    const recorder = screen.getByRole("button", { name: "Press global shortcut" });
     fireEvent.keyDown(recorder, { code: "KeyP", key: "p" });
     expect(onRecord).not.toHaveBeenCalled();
     expect(screen.getByText(/include at least one modifier/i)).toBeVisible();
@@ -41,8 +41,8 @@ describe("ShortcutRecorder", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Record shortcut" }));
-    fireEvent.keyDown(screen.getByRole("button", { name: "Press shortcut" }), {
+    fireEvent.click(screen.getByRole("button", { name: "Record global shortcut" }));
+    fireEvent.keyDown(screen.getByRole("button", { name: "Press global shortcut" }), {
       code: "KeyP",
       key: "p",
       ctrlKey: true,
@@ -51,14 +51,72 @@ describe("ShortcutRecorder", () => {
 
     expect(onRecord).toHaveBeenCalledWith("CommandOrControl+Shift+P");
     expect(screen.getByText(PREVIOUS)).toBeVisible();
-    expect(screen.getByRole("button", { name: "Registering shortcut" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Registering global shortcut" })).toBeDisabled();
 
     resolveRegistration("CommandOrControl+Shift+P");
     await waitFor(() =>
       expect(
-        screen.getByRole("button", { name: "Record shortcut" }),
+        screen.getByRole("button", { name: "Record global shortcut" }),
       ).toBeEnabled(),
     );
+  });
+
+  it("shows an unassigned shortcut and clears one through the same control", async () => {
+    const onClear = vi.fn(async () => null);
+    const view = render(
+      <ShortcutRecorder
+        label="preset cycling shortcut"
+        onClear={onClear}
+        onRecord={vi.fn(async (candidate: string) => candidate)}
+        platform="Win32"
+        value={null}
+      />,
+    );
+
+    expect(screen.getByText("Not set")).toBeVisible();
+    // Nothing to clear while it is unassigned.
+    expect(
+      screen.queryByRole("button", { name: "Clear preset cycling shortcut" }),
+    ).toBeNull();
+
+    view.rerender(
+      <ShortcutRecorder
+        label="preset cycling shortcut"
+        onClear={onClear}
+        onRecord={vi.fn(async (candidate: string) => candidate)}
+        platform="Win32"
+        value="CommandOrControl+Shift+P"
+      />,
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Clear preset cycling shortcut" }),
+    );
+
+    await waitFor(() => expect(onClear).toHaveBeenCalledTimes(1));
+  });
+
+  it("names its controls after the shortcut it records", () => {
+    render(
+      <ShortcutRecorder
+        id="cycle-shortcut"
+        label="preset cycling shortcut"
+        onRecord={vi.fn(async (candidate: string) => candidate)}
+        platform="Win32"
+        title="Preset cycling shortcut"
+        value={null}
+      />,
+    );
+
+    expect(
+      screen.getByRole("heading", { name: "Preset cycling shortcut" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Record preset cycling shortcut" }),
+    ).toBeVisible();
+    // The default global-shortcut names must not leak onto this instance.
+    expect(
+      screen.queryByRole("button", { name: "Record global shortcut" }),
+    ).toBeNull();
   });
 
   it("normalizes macOS Meta and retains the previous value on conflict", async () => {
@@ -73,8 +131,8 @@ describe("ShortcutRecorder", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Record shortcut" }));
-    fireEvent.keyDown(screen.getByRole("button", { name: "Press shortcut" }), {
+    fireEvent.click(screen.getByRole("button", { name: "Record global shortcut" }));
+    fireEvent.keyDown(screen.getByRole("button", { name: "Press global shortcut" }), {
       code: "KeyP",
       key: "p",
       metaKey: true,

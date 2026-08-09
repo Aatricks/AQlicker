@@ -42,9 +42,14 @@ export interface Preset {
 }
 
 export interface AppConfig {
-  schemaVersion: 4;
+  schemaVersion: 5;
   /** App-level, never per-preset, so switching presets never changes it. */
   globalShortcut: string;
+  /**
+   * App-level too. `null` leaves preset cycling unbound, which is where every
+   * migrated and every fresh configuration starts.
+   */
+  presetCycleShortcut: string | null;
   activePresetId: string;
   presets: Preset[];
 }
@@ -70,8 +75,9 @@ export const DEFAULT_PRESET: Preset = {
 };
 
 export const DEFAULT_CONFIG: AppConfig = {
-  schemaVersion: 4,
+  schemaVersion: 5,
   globalShortcut: "CommandOrControl+Shift+K",
+  presetCycleShortcut: null,
   activePresetId: DEFAULT_PRESET_ID,
   presets: [DEFAULT_PRESET],
 };
@@ -80,6 +86,19 @@ export function activePreset(config: AppConfig): Preset | null {
   return (
     config.presets.find((preset) => preset.id === config.activePresetId) ?? null
   );
+}
+
+/**
+ * The preset one step after the active one, wrapping around. `null` when the
+ * active preset is unresolvable or is the only one, which makes cycling a
+ * no-op. Mirrors `AppConfig::next_preset_id` in Rust.
+ */
+export function nextPresetId(config: AppConfig): string | null {
+  const index = config.presets.findIndex(
+    (preset) => preset.id === config.activePresetId,
+  );
+  if (index < 0 || config.presets.length < 2) return null;
+  return config.presets[(index + 1) % config.presets.length].id;
 }
 
 /** Field paths are relative to the preset; `validateConfig` prefixes them. */

@@ -2,8 +2,19 @@ import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { LOGICAL_KEYS, type LogicalKey } from "../domain/config";
 
 interface ShortcutRecorderProps {
-  value: string;
-  onRecord: (candidate: string) => Promise<string>;
+  /** `null` renders as unassigned, which the cycling shortcut starts as. */
+  value: string | null;
+  onRecord: (candidate: string) => Promise<unknown>;
+  /** Omitted for a shortcut that must always be assigned. */
+  onClear?: () => Promise<unknown>;
+  /** Shown until the next successful recording clears it. */
+  warning?: string | null;
+  /** Also the accessible name every control here is built from, so two
+   * recorders on one panel never share a name. */
+  label?: string;
+  id?: string;
+  title?: string;
+  description?: string;
   disabled?: boolean;
   platform?: string;
 }
@@ -52,6 +63,12 @@ function shortcutCandidate(
 export function ShortcutRecorder({
   value,
   onRecord,
+  onClear,
+  warning = null,
+  label = "global shortcut",
+  id = "shortcut",
+  title = "Global shortcut",
+  description = "Toggle AQlicker from any application.",
   disabled = false,
   platform = typeof navigator === "undefined" ? "" : navigator.platform,
 }: ShortcutRecorderProps) {
@@ -67,6 +84,17 @@ export function ShortcutRecorder({
   const beginRecording = () => {
     setError(null);
     setRecording(true);
+  };
+
+  const clear = () => {
+    if (disabled || registering || !onClear) return;
+    setError(null);
+    setRegistering(true);
+    void onClear()
+      .catch(() => {
+        setError("That shortcut could not be released. Try again.");
+      })
+      .finally(() => setRegistering(false));
   };
 
   const capture = (event: KeyboardEvent<HTMLButtonElement>) => {
@@ -105,20 +133,28 @@ export function ShortcutRecorder({
   return (
     <section
       className="config-section shortcut-recorder"
-      aria-labelledby="shortcut-title"
+      aria-labelledby={`${id}-title`}
     >
       <div className="section-heading">
         <div>
-          <h2 id="shortcut-title">Global shortcut</h2>
-          <p>Toggle AQlicker from any application.</p>
+          <h2 id={`${id}-title`}>{title}</h2>
+          <p>{description}</p>
         </div>
       </div>
 
       <div className="shortcut-row">
-        <kbd>{value}</kbd>
+        {value === null ? (
+          <span className="shortcut-unset" id={`${id}-value`}>
+            Not set
+          </span>
+        ) : (
+          <kbd id={`${id}-value`}>{value}</kbd>
+        )}
         {recording ? (
           <button
-            aria-label={registering ? "Registering shortcut" : "Press shortcut"}
+            aria-label={
+              registering ? `Registering ${label}` : `Press ${label}`
+            }
             className="recording-button"
             disabled={disabled || registering}
             onKeyDown={capture}
@@ -128,17 +164,34 @@ export function ShortcutRecorder({
             {registering ? "Registering…" : "Press shortcut…"}
           </button>
         ) : (
-          <button disabled={disabled} onClick={beginRecording} type="button">
+          <button
+            aria-describedby={`${id}-value`}
+            aria-label={`Record ${label}`}
+            disabled={disabled}
+            onClick={beginRecording}
+            type="button"
+          >
             Record shortcut
+          </button>
+        )}
+        {onClear && value !== null && !recording && (
+          <button
+            aria-describedby={`${id}-value`}
+            aria-label={`Clear ${label}`}
+            disabled={disabled || registering}
+            onClick={clear}
+            type="button"
+          >
+            Clear
           </button>
         )}
       </div>
       {recording && !registering && (
         <p className="capture-help">Hold a modifier, then press a supported key.</p>
       )}
-      {error && (
+      {(error ?? warning) && (
         <p className="field-error" role="alert">
-          {error}
+          {error ?? warning}
         </p>
       )}
     </section>

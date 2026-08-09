@@ -159,6 +159,65 @@ export function useConfig(api: AqlickerApi = aqlickerApi) {
     [updateConfig],
   );
 
+  /**
+   * Preset cycling and the menu bar item change the configuration in Rust. Only
+   * those two app-level fields are taken from the event and merged onto the
+   * current draft: the emitted document is whatever Rust last saved, so
+   * replacing the draft with it would throw away an edit still inside the
+   * debounce. The marker moves to the emitted document because that is what is
+   * genuinely on disk, which leaves the existing effect to notice the merged
+   * draft differs and persist the edit on its own.
+   */
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+
+    void api
+      .listenConfig((next) => {
+        if (!active) return;
+        persistedConfig.current = JSON.stringify(next);
+        setConfig((current) =>
+          current === null
+            ? next
+            : {
+                ...current,
+                // A draft that already deleted that preset must not be left
+                // pointing at it: nothing on screen could fix it.
+                activePresetId: current.presets.some(
+                  (preset) => preset.id === next.activePresetId,
+                )
+                  ? next.activePresetId
+                  : current.activePresetId,
+                presetCycleShortcut: next.presetCycleShortcut,
+              },
+        );
+      })
+      .then((stop) => {
+        if (active) unlisten = stop;
+        else stop();
+      })
+      .catch(() => undefined);
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [api]);
+
+  const registerCycleShortcut = useCallback(
+    async (candidate: string | null) => {
+      const registered = await api.setCycleShortcut(candidate);
+      if (mounted.current) {
+        updateConfig((current) => ({
+          ...current,
+          presetCycleShortcut: registered,
+        }));
+      }
+      return registered;
+    },
+    [api, updateConfig],
+  );
+
   const registerShortcut = useCallback(
     async (candidate: string) => {
       const registered = await api.setShortcut(candidate);
@@ -184,5 +243,6 @@ export function useConfig(api: AqlickerApi = aqlickerApi) {
     updateConfig,
     updatePreset,
     registerShortcut,
+    registerCycleShortcut,
   };
 }

@@ -195,6 +195,17 @@ ul {
   gap: 1rem;
 }
 
+/* Stands in for the keycap while a shortcut is unassigned. */
+.shortcut-unset {
+  margin-right: auto;
+  color: var(--ink-faint);
+  font-size: 0.85rem;
+}
+
+.shortcut-row kbd {
+  margin-right: auto;
+}
+
 .app-header {
   padding: 20px 22px 17px;
   border-bottom: 1px solid var(--line);

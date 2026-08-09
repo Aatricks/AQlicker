@@ -147,6 +147,14 @@ pub fn migrate_to_current(document: Value) -> Result<AppConfig, ConfigRepository
         });
     }
 
+    // v4 knew nothing about the preset-cycling shortcut. It migrates to v5 with
+    // that shortcut unassigned: claiming one would steal a hotkey the user may
+    // already have bound in another application.
+    if document.get("schemaVersion").and_then(Value::as_u64) == Some(4) {
+        document["schemaVersion"] = Value::from(5);
+        document["presetCycleShortcut"] = Value::Null;
+    }
+
     let schema_version = document
         .get("schemaVersion")
         .and_then(Value::as_u64)
@@ -329,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_loads_a_v4_file_unchanged() {
+    fn migration_loads_a_v4_file_with_an_unassigned_cycle_shortcut() {
         let directory = tempfile::tempdir().unwrap();
         write_fixture(
             directory.path(),
@@ -339,8 +347,28 @@ mod tests {
         let loaded = ConfigRepository::new(directory.path()).load().unwrap();
 
         assert!(loaded.notice.is_none());
+        assert_eq!(loaded.config.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(loaded.config.preset_cycle_shortcut, None);
         assert_eq!(loaded.config.presets.len(), 2);
         assert_eq!(loaded.config.active_preset_id, "preset-grinding");
+        assert_eq!(loaded.config.active_preset().unwrap().name, "Grinding");
+    }
+
+    #[test]
+    fn migration_loads_a_v5_file_keeping_its_cycle_shortcut() {
+        let directory = tempfile::tempdir().unwrap();
+        write_fixture(
+            directory.path(),
+            include_str!("../tests/fixtures/config-v5.json"),
+        );
+
+        let loaded = ConfigRepository::new(directory.path()).load().unwrap();
+
+        assert!(loaded.notice.is_none());
+        assert_eq!(
+            loaded.config.preset_cycle_shortcut.as_deref(),
+            Some("CommandOrControl+Shift+P")
+        );
         assert_eq!(loaded.config.active_preset().unwrap().name, "Grinding");
     }
 
@@ -385,7 +413,7 @@ mod tests {
     #[test]
     fn persistence_rejects_future_schema_without_replacing_the_file() {
         let directory = tempfile::tempdir().unwrap();
-        let path = write_fixture(directory.path(), r#"{"schemaVersion":5}"#);
+        let path = write_fixture(directory.path(), r#"{"schemaVersion":6}"#);
 
         let error = ConfigRepository::new(directory.path()).load().unwrap_err();
 

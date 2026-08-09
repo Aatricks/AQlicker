@@ -38,12 +38,16 @@ function App({ api = aqlickerApi }: AppProps) {
     updateConfig,
     updatePreset,
     registerShortcut,
+    registerCycleShortcut,
   } = useConfig(api);
   const run = useRunState(api, bootstrap?.run);
 
   const [permissionOverride, setPermissionOverride] =
     useState<PermissionStatus | null>(null);
   const [shortcutOverride, setShortcutOverride] = useState<boolean | null>(null);
+  const [cycleShortcutOverride, setCycleShortcutOverride] = useState<
+    boolean | null
+  >(null);
   const [requesting, setRequesting] = useState(false);
   const [recoveryDismissed, setRecoveryDismissed] = useState(false);
 
@@ -99,6 +103,28 @@ function App({ api = aqlickerApi }: AppProps) {
     },
     [registerShortcut],
   );
+
+  const recordCycleShortcut = useCallback(
+    async (candidate: string) => {
+      const registered = await registerCycleShortcut(candidate);
+      setCycleShortcutOverride(true);
+      return registered;
+    },
+    [registerCycleShortcut],
+  );
+
+  const clearCycleShortcut = useCallback(async () => {
+    const registered = await registerCycleShortcut(null);
+    setCycleShortcutOverride(true);
+    return registered;
+  }, [registerCycleShortcut]);
+
+  /**
+   * A cycling shortcut another application already owns would otherwise look
+   * exactly like a working one and simply do nothing.
+   */
+  const cycleShortcutRegistered =
+    cycleShortcutOverride ?? bootstrap?.cycleShortcut?.registered ?? true;
 
   const listApps = useCallback(() => api.listApps(), [api]);
 
@@ -215,6 +241,21 @@ function App({ api = aqlickerApi }: AppProps) {
               disabled={locked}
               onRecord={recordShortcut}
               value={config.globalShortcut}
+            />
+            <ShortcutRecorder
+              description="Switch to the next preset from any application. Refused while a run is active."
+              disabled={locked}
+              id="cycle-shortcut"
+              label="preset cycling shortcut"
+              onClear={clearCycleShortcut}
+              onRecord={recordCycleShortcut}
+              title="Preset cycling shortcut"
+              value={config.presetCycleShortcut}
+              warning={
+                config.presetCycleShortcut !== null && !cycleShortcutRegistered
+                  ? "Another application already uses it. Record another one."
+                  : null
+              }
             />
           </div>
         )}

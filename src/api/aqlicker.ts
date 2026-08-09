@@ -3,6 +3,9 @@ import { listen } from "@tauri-apps/api/event";
 import type { AppConfig, LogicalKey, Mode } from "../domain/config";
 
 export const RUN_STATE_EVENT = "aqlicker://run-state";
+/** The backend changes the configuration itself when a preset is cycled or
+ * chosen from the menu bar, so the webview has to be told. */
+export const CONFIG_EVENT = "aqlicker://config";
 
 export type RunStatus = "idle" | "running" | "stopping" | "failed";
 export type StopReason =
@@ -51,6 +54,8 @@ export interface BootstrapPayload {
   recoveryNotice: { code: string } | null;
   permission: PermissionStatus;
   shortcut: ShortcutRegistrationStatus;
+  /** `null` while the preset-cycling shortcut is unassigned. */
+  cycleShortcut: ShortcutRegistrationStatus | null;
   run: RunSnapshot;
 }
 
@@ -62,8 +67,10 @@ export interface AqlickerApi {
   requestAccess(): Promise<PermissionStatus>;
   permissionStatus(): Promise<PermissionStatus>;
   setShortcut(shortcut: string): Promise<string>;
+  setCycleShortcut(shortcut: string | null): Promise<string | null>;
   listApps(): Promise<RunningApp[]>;
   listenRunState(handler: (state: RunSnapshot) => void): Promise<() => void>;
+  listenConfig(handler: (config: AppConfig) => void): Promise<() => void>;
 }
 
 export const aqlickerApi: AqlickerApi = {
@@ -74,7 +81,11 @@ export const aqlickerApi: AqlickerApi = {
   requestAccess: () => invoke<PermissionStatus>("request_access"),
   permissionStatus: () => invoke<PermissionStatus>("permission_status"),
   setShortcut: (shortcut) => invoke<string>("set_shortcut", { shortcut }),
+  setCycleShortcut: (shortcut) =>
+    invoke<string | null>("set_cycle_shortcut", { shortcut }),
   listApps: () => invoke<RunningApp[]>("list_apps"),
   listenRunState: (handler) =>
     listen<RunSnapshot>(RUN_STATE_EVENT, (event) => handler(event.payload)),
+  listenConfig: (handler) =>
+    listen<AppConfig>(CONFIG_EVENT, (event) => handler(event.payload)),
 };

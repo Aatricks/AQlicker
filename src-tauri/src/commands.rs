@@ -20,6 +20,10 @@ use crate::{
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const RUN_STATE_EVENT: &str = "aqlicker://run-state";
+/// Emitted whenever the backend itself changes the configuration, which is
+/// what preset cycling and the tray's preset entries do. The webview holds
+/// its own copy, so without this it would keep showing the old preset.
+pub const CONFIG_EVENT: &str = "aqlicker://config";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +46,9 @@ pub struct BootstrapPayload {
     pub recovery_notice: Option<RecoveryNotice>,
     pub permission: PermissionStatus,
     pub shortcut: ShortcutRegistrationStatus,
+    /// `None` while the preset-cycling shortcut is unassigned, which is where
+    /// every migrated and every fresh configuration starts.
+    pub cycle_shortcut: Option<ShortcutRegistrationStatus>,
     pub run: RunSnapshot,
 }
 
@@ -93,21 +100,52 @@ impl RuntimeService for RunController {
 
 pub trait RunEventEmitter: Send + Sync {
     fn emit(&self, snapshot: &RunSnapshot);
+    fn emit_config(&self, config: &AppConfig);
 }
 
+/// Also keeps the menu bar item in step. Both methods are called only from the
+/// service dispatcher thread, so the state behind this lock is never contended
+/// and the main thread never waits on it: the finished `TrayModel` is moved by
+/// value onto the event loop.
 pub struct TauriRunEventEmitter {
     app: tauri::AppHandle,
+    tray: Mutex<TrayState>,
+}
+
+#[derive(Default)]
+struct TrayState {
+    config: Option<AppConfig>,
+    running: bool,
 }
 
 impl TauriRunEventEmitter {
-    pub const fn new(app: tauri::AppHandle) -> Self {
-        Self { app }
+    pub fn new(app: tauri::AppHandle) -> Self {
+        Self {
+            app,
+            tray: Mutex::new(TrayState::default()),
+        }
+    }
+
+    fn refresh_tray(&self) {
+        let model = {
+            let state = lock(&self.tray);
+            crate::tray::tray_model(state.config.as_ref(), state.running)
+        };
+        crate::tray::apply(&self.app, model);
     }
 }
 
 impl RunEventEmitter for TauriRunEventEmitter {
     fn emit(&self, snapshot: &RunSnapshot) {
+        lock(&self.tray).running = crate::tray::run_is_active(snapshot.status);
         let _ = self.app.emit(RUN_STATE_EVENT, snapshot.clone());
+        self.refresh_tray();
+    }
+
+    fn emit_config(&self, config: &AppConfig) {
+        lock(&self.tray).config = Some(config.clone());
+        let _ = self.app.emit(CONFIG_EVENT, config.clone());
+        self.refresh_tray();
     }
 }
 
@@ -223,6 +261,8 @@ enum ServiceAction {
     RequestAccess(Reply<PermissionStatus>),
     PermissionStatus(Reply<PermissionStatus>),
     SetShortcut(String, Reply<String>),
+    SetCycleShortcut(Option<String>, Reply<Option<String>>),
+    SelectPreset(String),
     Shortcut(ShortcutAction, Option<Reply<RunSnapshot>>),
     Snapshot(Sender<RunSnapshot>),
     RuntimeWake,
@@ -331,6 +371,20 @@ impl AppService {
 
     pub fn set_shortcut(&self, shortcut: String) -> Result<String, CommandError> {
         self.request(|reply| ServiceAction::SetShortcut(shortcut, reply))
+    }
+
+    pub fn set_cycle_shortcut(
+        &self,
+        shortcut: Option<String>,
+    ) -> Result<Option<String>, CommandError> {
+        self.request(|reply| ServiceAction::SetCycleShortcut(shortcut, reply))
+    }
+
+    /// Queues a preset switch and returns at once. The tray menu handler runs on
+    /// the main thread and the dispatcher needs the main thread to register
+    /// shortcuts, so it must never wait for a reply.
+    pub fn enqueue_select_preset(&self, preset_id: String) -> Result<(), CommandError> {
+        self.enqueue(ServiceAction::SelectPreset(preset_id))
     }
 
     pub fn handle_shortcut(&self, action: ShortcutAction) -> Result<RunSnapshot, CommandError> {
@@ -471,15 +525,38 @@ impl ServiceCore {
                 error: Some(error.code.to_owned()),
             },
         };
+        let cycle_shortcut =
+            loaded
+                .config
+                .preset_cycle_shortcut
+                .clone()
+                .map(
+                    |requested| match self.shortcuts.replace_cycle(Some(&requested)) {
+                        Ok(()) => ShortcutRegistrationStatus {
+                            shortcut: requested,
+                            registered: self.shortcuts.cycle_registered(),
+                            error: None,
+                        },
+                        Err(error) => ShortcutRegistrationStatus {
+                            shortcut: requested,
+                            registered: false,
+                            error: Some(error.code.to_owned()),
+                        },
+                    },
+                );
         let permission = self.permission.status();
         self.visible_run = self.runtime.snapshot();
         self.emitter.emit(&self.visible_run);
+        // The menu bar item is built before any configuration exists, so it has
+        // no presets to list until this lands.
+        self.emitter.emit_config(&loaded.config);
         self.current_config = Some(loaded.config.clone());
         Ok(BootstrapPayload {
             config: loaded.config,
             recovery_notice: loaded.notice,
             permission,
             shortcut,
+            cycle_shortcut,
             run: self.visible_run.clone(),
         })
     }
@@ -547,13 +624,25 @@ impl ServiceCore {
             return Err(CommandError::new("invalid-config"));
         }
         let previous = self.shortcuts.active().map(str::to_owned);
+        let previous_cycle = self.shortcuts.cycle().map(str::to_owned);
         self.shortcuts.replace(&config.global_shortcut)?;
+        if let Err(error) = self
+            .shortcuts
+            .replace_cycle(config.preset_cycle_shortcut.as_deref())
+        {
+            if self
+                .restore_shortcuts(previous.as_deref(), previous_cycle.as_deref())
+                .is_err()
+            {
+                return Err(CommandError::new("shortcut-rollback-failed"));
+            }
+            return Err(error.into());
+        }
         if let Err(error) = self.repository.save(&config) {
-            let rollback = match previous {
-                Some(previous) => self.shortcuts.replace(&previous).map(|_| ()),
-                None => self.shortcuts.unregister_toggle(),
-            };
-            if rollback.is_err() {
+            if self
+                .restore_shortcuts(previous.as_deref(), previous_cycle.as_deref())
+                .is_err()
+            {
                 return Err(CommandError::new("shortcut-rollback-failed"));
             }
             return Err(match error {
@@ -561,8 +650,50 @@ impl ServiceCore {
                 _ => CommandError::new("config-save-failed"),
             });
         }
+        self.emitter.emit_config(&config);
         self.current_config = Some(config);
         Ok(())
+    }
+
+    /// Puts both app-level accelerators back after a failed save. The cycle slot
+    /// is released first so a swap between the two slots cannot self-conflict.
+    fn restore_shortcuts(
+        &mut self,
+        toggle: Option<&str>,
+        cycle: Option<&str>,
+    ) -> Result<(), ShortcutError> {
+        self.shortcuts.replace_cycle(None)?;
+        match toggle {
+            Some(toggle) => self.shortcuts.replace(toggle).map(|_| ())?,
+            None => self.shortcuts.unregister_toggle()?,
+        }
+        self.shortcuts.replace_cycle(cycle)
+    }
+
+    /// A run locks the whole configuration, exactly as the interface does.
+    fn configuration_locked(&mut self) -> bool {
+        crate::tray::run_is_active(self.runtime.snapshot().status)
+    }
+
+    fn select_preset(&mut self, preset_id: &str) -> Result<(), CommandError> {
+        if self.configuration_locked() {
+            return Err(CommandError::new("run-active"));
+        }
+        let mut config = self.current_or_loaded_config()?;
+        if config.active_preset_id == preset_id {
+            return Ok(());
+        }
+        config.active_preset_id = preset_id.to_owned();
+        self.save_config(config)
+    }
+
+    /// Wraps around, and does nothing at all when there is only one preset.
+    fn cycle_preset(&mut self) -> Result<(), CommandError> {
+        let config = self.current_or_loaded_config()?;
+        match config.next_preset_id().map(str::to_owned) {
+            Some(next) => self.select_preset(&next),
+            None => Ok(()),
+        }
     }
 
     fn stop(&mut self) -> RunSnapshot {
@@ -588,6 +719,10 @@ impl ServiceCore {
         }
         match action {
             ShortcutAction::StopRun => Ok(self.stop()),
+            ShortcutAction::CyclePreset => {
+                self.cycle_preset()?;
+                Ok(self.visible_run.clone())
+            }
             ShortcutAction::ToggleRun => match self.runtime.snapshot().status {
                 RunStatus::Running => Ok(self.stop()),
                 RunStatus::Stopping | RunStatus::Failed => Ok(self.runtime.snapshot()),
@@ -716,6 +851,16 @@ fn dispatch_actions(
                 });
                 let _ = reply.send(result);
             }
+            ServiceAction::SetCycleShortcut(shortcut, reply) => {
+                let result = core.current_or_loaded_config().and_then(|mut config| {
+                    config.preset_cycle_shortcut = shortcut.clone();
+                    core.save_config(config).map(|()| shortcut)
+                });
+                let _ = reply.send(result);
+            }
+            ServiceAction::SelectPreset(preset_id) => {
+                let _ = core.select_preset(&preset_id);
+            }
             ServiceAction::Shortcut(action, reply) => {
                 let result = core.handle_shortcut(action);
                 if let Some(reply) = reply {
@@ -805,6 +950,14 @@ pub async fn set_shortcut(shortcut: String, app: tauri::AppHandle) -> Result<Str
     on_service(app, move |service| service.set_shortcut(shortcut)).await
 }
 
+#[tauri::command]
+pub async fn set_cycle_shortcut(
+    shortcut: Option<String>,
+    app: tauri::AppHandle,
+) -> Result<Option<String>, CommandError> {
+    on_service(app, move |service| service.set_cycle_shortcut(shortcut)).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -813,7 +966,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{KeyEntry, LogicalKey, StopReason};
+    use crate::{DEFAULT_PRESET_ID, KeyEntry, LogicalKey, StopReason};
 
     type Signal = Arc<(Mutex<bool>, Condvar)>;
 
@@ -924,6 +1077,7 @@ mod tests {
             Box::new(FakeRuntime::new(Arc::new(Mutex::new(0)))),
             Arc::new(RecordingEmitter {
                 emitted: Arc::clone(&emitted),
+                ..RecordingEmitter::default()
             }),
         );
 
@@ -1037,6 +1191,7 @@ mod tests {
             Box::new(FakeRuntime::new(Arc::new(Mutex::new(0)))),
             Arc::new(RecordingEmitter {
                 emitted: Arc::clone(&emitted),
+                ..RecordingEmitter::default()
             }),
         );
         service.save_config(valid_config()).unwrap();
@@ -1564,6 +1719,288 @@ mod tests {
         assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
     }
 
+    fn cycling_config() -> AppConfig {
+        let preset = |id: &str| Preset {
+            id: id.to_owned(),
+            name: id.to_uppercase(),
+            keys: vec![KeyEntry::new(LogicalKey::KeyA)],
+            ..Preset::default()
+        };
+        AppConfig {
+            // The active preset is deliberately the middle one.
+            active_preset_id: "b".to_owned(),
+            presets: vec![preset("a"), preset("b"), preset("c")],
+            ..AppConfig::default()
+        }
+    }
+
+    fn stored_active_preset(directory: &std::path::Path) -> String {
+        ConfigRepository::new(directory)
+            .load()
+            .unwrap()
+            .config
+            .active_preset_id
+    }
+
+    #[test]
+    fn cycling_advances_the_active_preset_wrapping_around_and_persists_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = test_service(
+            directory.path(),
+            Box::new(FakePermission { granted: true }),
+            Arc::new(Mutex::new(0)),
+        );
+        service.save_config(cycling_config()).unwrap();
+
+        // b -> c -> a proves the wrap, and -> b proves it keeps going.
+        for expected in ["c", "a", "b"] {
+            service
+                .enqueue_shortcut(ShortcutAction::CyclePreset)
+                .unwrap();
+            // The dispatcher is FIFO, so a reply to this proves the queued
+            // cycle was handled first.
+            service.run_snapshot();
+            assert_eq!(stored_active_preset(directory.path()), expected);
+        }
+    }
+
+    #[test]
+    fn cycling_one_preset_changes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = test_service(
+            directory.path(),
+            Box::new(FakePermission { granted: true }),
+            Arc::new(Mutex::new(0)),
+        );
+        service.save_config(valid_config()).unwrap();
+
+        service
+            .enqueue_shortcut(ShortcutAction::CyclePreset)
+            .unwrap();
+        service.run_snapshot();
+
+        assert_eq!(stored_active_preset(directory.path()), DEFAULT_PRESET_ID);
+    }
+
+    #[test]
+    fn an_active_run_refuses_both_cycling_and_a_tray_preset_choice() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = test_service(
+            directory.path(),
+            Box::new(FakePermission { granted: true }),
+            Arc::new(Mutex::new(0)),
+        );
+        service.save_config(cycling_config()).unwrap();
+        service.start(cycling_config()).unwrap();
+        assert_eq!(service.run_snapshot().status, RunStatus::Running);
+
+        service
+            .enqueue_shortcut(ShortcutAction::CyclePreset)
+            .unwrap();
+        service.enqueue_select_preset("c".to_owned()).unwrap();
+        service.run_snapshot();
+
+        assert_eq!(stored_active_preset(directory.path()), "b");
+    }
+
+    #[test]
+    fn a_tray_preset_choice_switches_and_ignores_an_unknown_preset() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = test_service(
+            directory.path(),
+            Box::new(FakePermission { granted: true }),
+            Arc::new(Mutex::new(0)),
+        );
+        service.save_config(cycling_config()).unwrap();
+
+        service.enqueue_select_preset("a".to_owned()).unwrap();
+        service.run_snapshot();
+        assert_eq!(stored_active_preset(directory.path()), "a");
+
+        service.enqueue_select_preset("gone".to_owned()).unwrap();
+        service.run_snapshot();
+        assert_eq!(stored_active_preset(directory.path()), "a");
+    }
+
+    #[test]
+    fn bootstrap_registers_a_stored_cycle_shortcut_and_reports_a_conflict() {
+        for (shortcuts, registered, error) in [
+            (FakeShortcuts::available(), true, None),
+            (
+                FakeShortcuts::with_cycle_conflict("Alt+1"),
+                false,
+                Some("shortcut-conflict"),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            ConfigRepository::new(directory.path())
+                .save(&AppConfig {
+                    preset_cycle_shortcut: Some("Alt+1".to_owned()),
+                    ..valid_config()
+                })
+                .unwrap();
+            let service = AppService::new(
+                ConfigRepository::new(directory.path()),
+                Box::new(FakePermission { granted: true }),
+                Box::new(shortcuts),
+                Box::new(FakeRuntime::new(Arc::new(Mutex::new(0)))),
+                Arc::new(RecordingEmitter::default()),
+            );
+
+            let cycle = service.bootstrap().unwrap().cycle_shortcut.unwrap();
+
+            assert_eq!(cycle.shortcut, "Alt+1");
+            assert_eq!(cycle.registered, registered);
+            assert_eq!(cycle.error.as_deref(), error);
+        }
+    }
+
+    #[test]
+    fn bootstrap_reports_no_cycle_shortcut_while_it_is_unassigned() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = test_service(
+            directory.path(),
+            Box::new(FakePermission { granted: true }),
+            Arc::new(Mutex::new(0)),
+        );
+
+        assert_eq!(service.bootstrap().unwrap().cycle_shortcut, None);
+    }
+
+    #[test]
+    fn the_cycle_shortcut_is_stored_and_cleared_through_the_registration_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = test_service(
+            directory.path(),
+            Box::new(FakePermission { granted: true }),
+            Arc::new(Mutex::new(0)),
+        );
+        service.save_config(valid_config()).unwrap();
+
+        assert_eq!(
+            service
+                .set_cycle_shortcut(Some("Alt+1".to_owned()))
+                .unwrap(),
+            Some("Alt+1".to_owned())
+        );
+        assert_eq!(
+            ConfigRepository::new(directory.path())
+                .load()
+                .unwrap()
+                .config
+                .preset_cycle_shortcut,
+            Some("Alt+1".to_owned())
+        );
+
+        assert_eq!(service.set_cycle_shortcut(None).unwrap(), None);
+        assert_eq!(
+            ConfigRepository::new(directory.path())
+                .load()
+                .unwrap()
+                .config
+                .preset_cycle_shortcut,
+            None
+        );
+    }
+
+    #[test]
+    fn a_cycle_shortcut_conflict_keeps_the_stored_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = AppService::new(
+            ConfigRepository::new(directory.path()),
+            Box::new(FakePermission { granted: true }),
+            Box::new(FakeShortcuts::with_cycle_conflict("Alt+1")),
+            Box::new(FakeRuntime::new(Arc::new(Mutex::new(0)))),
+            Arc::new(RecordingEmitter::default()),
+        );
+        service.save_config(valid_config()).unwrap();
+
+        assert_eq!(
+            service
+                .set_cycle_shortcut(Some("Alt+1".to_owned()))
+                .unwrap_err()
+                .code,
+            "shortcut-conflict"
+        );
+        assert_eq!(
+            ConfigRepository::new(directory.path())
+                .load()
+                .unwrap()
+                .config
+                .preset_cycle_shortcut,
+            None
+        );
+    }
+
+    #[test]
+    fn a_cycle_shortcut_conflict_keeps_the_one_already_registered() {
+        let directory = tempfile::tempdir().unwrap();
+        let cycle = Arc::new(Mutex::new(None));
+        let service = AppService::new(
+            ConfigRepository::new(directory.path()),
+            Box::new(FakePermission { granted: true }),
+            Box::new(FakeShortcuts::with_cycle_state(Arc::clone(&cycle), "Alt+1")),
+            Box::new(FakeRuntime::new(Arc::new(Mutex::new(0)))),
+            Arc::new(RecordingEmitter::default()),
+        );
+        service.save_config(valid_config()).unwrap();
+        service
+            .set_cycle_shortcut(Some("Alt+2".to_owned()))
+            .unwrap();
+        assert_eq!(cycle.lock().unwrap().as_deref(), Some("Alt+2"));
+
+        assert_eq!(
+            service
+                .set_cycle_shortcut(Some("Alt+1".to_owned()))
+                .unwrap_err()
+                .code,
+            "shortcut-conflict"
+        );
+
+        // The rejected change must not cost the user the shortcut that worked.
+        assert_eq!(cycle.lock().unwrap().as_deref(), Some("Alt+2"));
+        assert_eq!(
+            ConfigRepository::new(directory.path())
+                .load()
+                .unwrap()
+                .config
+                .preset_cycle_shortcut,
+            Some("Alt+2".to_owned())
+        );
+    }
+
+    #[test]
+    fn every_backend_configuration_change_is_forwarded_to_the_interface() {
+        let directory = tempfile::tempdir().unwrap();
+        let configs = Arc::new(Mutex::new(Vec::new()));
+        let service = AppService::new(
+            ConfigRepository::new(directory.path()),
+            Box::new(FakePermission { granted: true }),
+            Box::new(FakeShortcuts::available()),
+            Box::new(FakeRuntime::new(Arc::new(Mutex::new(0)))),
+            Arc::new(RecordingEmitter {
+                configs: Arc::clone(&configs),
+                ..RecordingEmitter::default()
+            }),
+        );
+        service.save_config(cycling_config()).unwrap();
+
+        service
+            .enqueue_shortcut(ShortcutAction::CyclePreset)
+            .unwrap();
+        service.run_snapshot();
+
+        assert_eq!(
+            configs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|config| config.active_preset_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["b".to_owned(), "c".to_owned()]
+        );
+    }
+
     fn test_service(
         directory: &std::path::Path,
         permission: Box<dyn PermissionProvider>,
@@ -1591,6 +2028,11 @@ mod tests {
 
     struct FakeShortcuts {
         active: String,
+        cycle: Option<String>,
+        /// Mirrors `cycle` so a test can watch the registration without
+        /// reaching into the boxed controller.
+        cycle_handle: Arc<Mutex<Option<String>>>,
+        cycle_conflict: Option<String>,
         toggle_registered: bool,
         escape_available: bool,
         escape_registered: Arc<AtomicBool>,
@@ -1603,6 +2045,9 @@ mod tests {
         fn available() -> Self {
             Self {
                 active: "CommandOrControl+Shift+K".to_owned(),
+                cycle: None,
+                cycle_handle: Arc::new(Mutex::new(None)),
+                cycle_conflict: None,
                 toggle_registered: true,
                 escape_available: true,
                 escape_registered: Arc::new(AtomicBool::new(false)),
@@ -1615,6 +2060,21 @@ mod tests {
         fn with_escape_state(escape_registered: Arc<AtomicBool>) -> Self {
             Self {
                 escape_registered,
+                ..Self::available()
+            }
+        }
+
+        fn with_cycle_conflict(shortcut: &str) -> Self {
+            Self {
+                cycle_conflict: Some(shortcut.to_owned()),
+                ..Self::available()
+            }
+        }
+
+        fn with_cycle_state(cycle_handle: Arc<Mutex<Option<String>>>, conflict: &str) -> Self {
+            Self {
+                cycle_handle,
+                cycle_conflict: Some(conflict.to_owned()),
                 ..Self::available()
             }
         }
@@ -1636,6 +2096,7 @@ mod tests {
 
     struct TrackedShortcuts {
         active: String,
+        cycle: Option<String>,
         escape_registered: Arc<AtomicBool>,
         toggle_registered: Arc<AtomicBool>,
         dropped: Option<Signal>,
@@ -1649,6 +2110,7 @@ mod tests {
         ) -> Self {
             Self {
                 active: valid_config().global_shortcut,
+                cycle: None,
                 escape_registered,
                 toggle_registered,
                 dropped,
@@ -1671,12 +2133,25 @@ mod tests {
             Ok(shortcut.to_owned())
         }
 
+        fn replace_cycle(&mut self, shortcut: Option<&str>) -> Result<(), ShortcutError> {
+            self.cycle = shortcut.map(str::to_owned);
+            Ok(())
+        }
+
         fn active(&self) -> Option<&str> {
             Some(&self.active)
         }
 
+        fn cycle(&self) -> Option<&str> {
+            self.cycle.as_deref()
+        }
+
         fn toggle_registered(&self) -> bool {
             self.toggle_registered.load(Ordering::SeqCst)
+        }
+
+        fn cycle_registered(&self) -> bool {
+            self.cycle.is_some()
         }
 
         fn unregister_toggle(&mut self) -> Result<(), ShortcutError> {
@@ -2129,11 +2604,16 @@ mod tests {
     #[derive(Default)]
     struct RecordingEmitter {
         emitted: Arc<Mutex<Vec<RunSnapshot>>>,
+        configs: Arc<Mutex<Vec<AppConfig>>>,
     }
 
     impl RunEventEmitter for RecordingEmitter {
         fn emit(&self, snapshot: &RunSnapshot) {
             self.emitted.lock().unwrap().push(snapshot.clone());
+        }
+
+        fn emit_config(&self, config: &AppConfig) {
+            self.configs.lock().unwrap().push(config.clone());
         }
     }
 
@@ -2150,12 +2630,30 @@ mod tests {
             Ok(shortcut.to_owned())
         }
 
+        fn replace_cycle(&mut self, shortcut: Option<&str>) -> Result<(), ShortcutError> {
+            // Like the real manager, a conflict leaves the slot as it was.
+            if shortcut.is_some() && shortcut == self.cycle_conflict.as_deref() {
+                return Err(ShortcutError::new("shortcut-conflict"));
+            }
+            self.cycle = shortcut.map(str::to_owned);
+            *self.cycle_handle.lock().unwrap() = self.cycle.clone();
+            Ok(())
+        }
+
         fn active(&self) -> Option<&str> {
             Some(&self.active)
         }
 
+        fn cycle(&self) -> Option<&str> {
+            self.cycle.as_deref()
+        }
+
         fn toggle_registered(&self) -> bool {
             self.toggle_registered
+        }
+
+        fn cycle_registered(&self) -> bool {
+            self.cycle.is_some()
         }
 
         fn unregister_toggle(&mut self) -> Result<(), ShortcutError> {
