@@ -224,6 +224,10 @@ describe("PresetControls", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Rename preset" }));
     expect(screen.getByRole("alert")).toHaveTextContent("Name the preset");
+    // Announced is not enough: it has to be associated with the field.
+    const field = screen.getByRole("textbox", { name: /Preset name/ });
+    expect(field).toHaveAttribute("aria-invalid", "true");
+    expect(field).toHaveAccessibleDescription("Name the preset");
   });
 
   it("deletes the active preset and activates a survivor", () => {
